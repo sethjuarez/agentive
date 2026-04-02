@@ -167,6 +167,62 @@ async fn test_anthropic_simple_chat() {
 }
 
 #[tokio::test]
+async fn test_anthropic_tool_calling() {
+    let api_key = require_env!("ANTHROPIC_API_KEY");
+    let model =
+        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+
+    let provider = Arc::new(AnthropicProvider::new(&api_key, &model));
+
+    let result = run(
+        provider,
+        vec![
+            ChatMessage::system("You are a calculator. Always use the add tool to compute sums."),
+            ChatMessage::user("What is 3 + 5?"),
+        ],
+        vec![Tool::function(
+            "add",
+            "Add two numbers",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "number"},
+                    "b": {"type": "number"}
+                },
+                "required": ["a", "b"]
+            }),
+        )],
+        |tc| {
+            let args: serde_json::Value =
+                parse_tool_args(&tc.function.arguments).unwrap_or_default();
+            let a = args["a"].as_f64().unwrap_or(0.0);
+            let b = args["b"].as_f64().unwrap_or(0.0);
+            Ok(format!("{}", a + b))
+        },
+        RunnerConfig::default(),
+        CancellationToken::new(),
+        Steering::new(),
+        Guardrails::default(),
+        |_| {},
+    )
+    .await
+    .expect("Anthropic tool calling should succeed");
+
+    assert!(
+        result.response.contains('8'),
+        "Response should mention 8: {}",
+        result.response
+    );
+    // Verify the tool loop actually happened
+    let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+    assert!(!tool_msgs.is_empty(), "Should have tool result messages");
+    assert!(
+        result.total_usage.total_tokens > 0,
+        "Anthropic should report usage"
+    );
+}
+
+#[tokio::test]
 async fn test_azure_openai_chat() {
     let endpoint = require_env!("AZURE_OPENAI_ENDPOINT");
     let api_key = require_env!("AZURE_OPENAI_API_KEY");
