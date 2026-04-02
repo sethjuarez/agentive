@@ -78,6 +78,7 @@ impl Provider for OpenAiProvider {
             "model": self.model,
             "messages": request.messages,
             "stream": true,
+            "stream_options": {"include_usage": true},
             "tools": request.tools,
         });
 
