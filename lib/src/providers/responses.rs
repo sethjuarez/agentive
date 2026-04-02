@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::sync::mpsc;
 
+use crate::auth::AuthStrategy;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
@@ -26,7 +27,7 @@ use crate::types::*;
 /// input/output format and SSE event types.
 pub struct ResponsesProvider {
     endpoint: String,
-    api_key: String,
+    auth: AuthStrategy,
     model: String,
     client: Client,
     context_budget: usize,
@@ -35,10 +36,32 @@ pub struct ResponsesProvider {
 
 impl ResponsesProvider {
     /// Create a new Responses API provider.
+    ///
+    /// Auth is auto-detected: Azure endpoints use `api-key` header,
+    /// others use `Bearer` token. For Entra/OAuth tokens, use
+    /// [`with_auth`](Self::with_auth) instead.
     pub fn new(endpoint: &str, api_key: &str, model: &str) -> Self {
+        let trimmed = endpoint.trim_end_matches('/');
+        let auth = if trimmed.contains("azure.com") {
+            AuthStrategy::ApiKey(api_key.to_string())
+        } else {
+            AuthStrategy::Bearer(api_key.to_string())
+        };
+        Self {
+            endpoint: trimmed.to_string(),
+            auth,
+            model: model.to_string(),
+            client: Client::new(),
+            context_budget: 200_000,
+            vision: false,
+        }
+    }
+
+    /// Create a provider with an explicit auth strategy.
+    pub fn with_auth(endpoint: &str, auth: AuthStrategy, model: &str) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            auth,
             model: model.to_string(),
             client: Client::new(),
             context_budget: 200_000,
@@ -59,17 +82,12 @@ impl ResponsesProvider {
     }
 
     fn responses_url(&self) -> String {
-        if self.is_azure() {
+        let is_azure = self.endpoint.contains("azure.com");
+        if is_azure {
             format!("{}/openai/v1/responses", self.endpoint)
         } else {
             format!("{}/v1/responses", self.endpoint)
         }
-    }
-
-    fn is_azure(&self) -> bool {
-        self.endpoint.contains(".openai.azure.com")
-            || self.endpoint.contains(".services.ai.azure.com")
-            || self.endpoint.contains(".azure.com")
     }
 
     /// Convert agentive ChatMessages to Responses API input items.
@@ -201,11 +219,7 @@ impl Provider for ResponsesProvider {
         }
 
         let mut req = self.client.post(self.responses_url()).json(&body);
-        if self.is_azure() {
-            req = req.header("api-key", &self.api_key);
-        } else {
-            req = req.bearer_auth(&self.api_key);
-        }
+        req = self.auth.apply(req);
 
         let response = req.send().await?;
 

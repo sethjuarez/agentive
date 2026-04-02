@@ -30,6 +30,7 @@
 //! # }
 //! ```
 
+pub mod auth;
 pub mod cancel;
 pub mod context;
 pub mod error;
@@ -42,6 +43,7 @@ pub mod sanitize;
 pub mod steering;
 pub mod types;
 
+pub use auth::AuthStrategy;
 pub use cancel::CancellationToken;
 pub use error::AgentError;
 pub use guardrails::{GuardrailResult, Guardrails};

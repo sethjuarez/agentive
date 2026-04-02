@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::sync::mpsc;
 
+use crate::auth::AuthStrategy;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
@@ -21,7 +22,7 @@ use crate::types::*;
 /// that speaks the OpenAI chat completions SSE protocol.
 pub struct OpenAiProvider {
     endpoint: String,
-    api_key: String,
+    auth: AuthStrategy,
     model: String,
     client: Client,
     context_budget: usize,
@@ -30,10 +31,46 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     /// Create a new provider pointing at an OpenAI-compatible endpoint.
+    ///
+    /// Auth is auto-detected: Azure endpoints use `api-key` header,
+    /// others use `Bearer` token. For Entra/OAuth tokens, use
+    /// [`with_auth`](Self::with_auth) instead.
     pub fn new(endpoint: &str, api_key: &str, model: &str) -> Self {
+        let trimmed = endpoint.trim_end_matches('/');
+        let auth = if trimmed.contains("azure.com") {
+            AuthStrategy::ApiKey(api_key.to_string())
+        } else {
+            AuthStrategy::Bearer(api_key.to_string())
+        };
+        Self {
+            endpoint: trimmed.to_string(),
+            auth,
+            model: model.to_string(),
+            client: Client::new(),
+            context_budget: 200_000,
+            vision: false,
+        }
+    }
+
+    /// Create a provider with an explicit auth strategy.
+    ///
+    /// Use this for Microsoft Foundry with Entra ID tokens:
+    /// ```no_run
+    /// use agentive::{OpenAiProvider, AuthStrategy};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let token = Arc::new(Mutex::new("initial-token".to_string()));
+    /// let token_ref = token.clone();
+    /// let provider = OpenAiProvider::with_auth(
+    ///     "https://my-resource.services.ai.azure.com",
+    ///     AuthStrategy::Dynamic(Arc::new(move || token_ref.lock().unwrap().clone())),
+    ///     "gpt-4o",
+    /// );
+    /// ```
+    pub fn with_auth(endpoint: &str, auth: AuthStrategy, model: &str) -> Self {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            auth,
             model: model.to_string(),
             client: Client::new(),
             context_budget: 200_000,
@@ -60,10 +97,6 @@ impl OpenAiProvider {
             format!("{}/chat/completions", self.endpoint)
         }
     }
-
-    fn is_azure(&self) -> bool {
-        self.endpoint.contains("azure.com")
-    }
 }
 
 #[async_trait::async_trait]
@@ -89,11 +122,7 @@ impl Provider for OpenAiProvider {
         }
 
         let mut req = self.client.post(self.chat_url()).json(&body);
-        if self.is_azure() {
-            req = req.header("api-key", &self.api_key);
-        } else {
-            req = req.bearer_auth(&self.api_key);
-        }
+        req = self.auth.apply(req);
 
         let response = req.send().await?;
 
@@ -301,11 +330,24 @@ mod tests {
     }
 
     #[test]
-    fn test_is_azure() {
+    fn test_auth_auto_detection() {
+        // Azure endpoints should get ApiKey auth
         let p = OpenAiProvider::new("https://my-resource.openai.azure.com/v1", "k", "m");
-        assert!(p.is_azure());
+        assert!(matches!(p.auth, AuthStrategy::ApiKey(_)));
+        // Non-Azure endpoints should get Bearer auth
         let p = OpenAiProvider::new("https://api.openai.com/v1", "k", "m");
-        assert!(!p.is_azure());
+        assert!(matches!(p.auth, AuthStrategy::Bearer(_)));
+    }
+
+    #[test]
+    fn test_with_auth_explicit() {
+        use std::sync::Arc;
+        let p = OpenAiProvider::with_auth(
+            "https://my-foundry.services.ai.azure.com",
+            AuthStrategy::Dynamic(Arc::new(|| "my-entra-token".to_string())),
+            "gpt-4o",
+        );
+        assert!(matches!(p.auth, AuthStrategy::Dynamic(_)));
     }
 
     #[test]
