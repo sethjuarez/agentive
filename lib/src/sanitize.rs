@@ -1,4 +1,9 @@
 //! Sanitization utilities for cleaning tool results before sending to APIs.
+//!
+//! Tool results can contain control characters, null bytes, and large
+//! inline base64 data URIs. These cause JSON parse errors or bloat API
+//! requests. Use [`sanitize_for_api`] to clean results before including
+//! them in conversation history.
 
 /// Strip control characters (except newlines, carriage returns, tabs) and
 /// remove large inline base64 data URIs that bloat API requests without

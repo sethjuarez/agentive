@@ -1,3 +1,8 @@
+//! Core types for agentive — messages, tools, requests, responses, and events.
+//!
+//! All types derive `Serialize`/`Deserialize` for easy JSON conversion.
+//! `ChatMessage` supports multimodal content via [`MessageContent`].
+
 use serde::{Deserialize, Serialize};
 
 // -- Message content (supports text and multimodal) --------------------------

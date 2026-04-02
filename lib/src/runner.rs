@@ -1,10 +1,33 @@
 //! Agentic runner — the core multi-turn LLM + tool execution loop.
 //!
-//! Flow: send messages → stream LLM response → if tool_calls → execute tools →
-//! append results → re-call LLM → repeat until text response or limit.
+//! The [`run`] function is the main entry point. It:
+//! 1. Sends messages to the LLM provider (streaming)
+//! 2. Collects the response — if it contains tool calls, executes them
+//! 3. Appends tool results to the conversation and loops back to step 1
+//! 4. Repeats until the LLM returns a text response (no tool calls) or limits are hit
 //!
-//! The runner is generic over tool execution — apps pass a closure that
-//! handles their specific tools.
+//! The runner emits [`RunnerEvent`]s via a callback so apps can stream tokens
+//! to the UI, persist conversation state, and show tool execution progress.
+//!
+//! # Example
+//! ```no_run
+//! use agentive::*;
+//! use std::sync::Arc;
+//!
+//! # async fn example() -> Result<(), AgentError> {
+//! let provider = Arc::new(OpenAiProvider::new("https://api.openai.com/v1", "sk-...", "gpt-4o"));
+//! let result = agentive::run(
+//!     provider,
+//!     vec![ChatMessage::system("You are helpful"), ChatMessage::user("Hi")],
+//!     vec![],
+//!     |_call| Ok("not implemented".into()),
+//!     RunnerConfig::default(),
+//!     CancellationToken::new(),
+//!     |event| { /* handle events */ },
+//! ).await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::sync::Arc;
 
