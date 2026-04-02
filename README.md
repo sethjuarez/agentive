@@ -79,7 +79,7 @@ async fn main() -> Result<(), agentive::AgentError> {
 |--------|-------------|
 | `types` | `ChatMessage`, `ToolCall`, `Tool`, `ChatRequest/Response`, `MessageContent` (multimodal) |
 | `provider` | `Provider` trait — implement this for custom LLM backends |
-| `providers::openai` | OpenAI, Azure OpenAI, Azure AI Foundry — any OpenAI-compatible endpoint |
+| `providers::openai` | OpenAI, Azure OpenAI, Microsoft Foundry — any OpenAI-compatible endpoint |
 | `providers::anthropic` | Anthropic Messages API with content block streaming |
 | `providers::sse` | Shared SSE line parser |
 | `runner` | The agentic loop — `run()` function with `RunnerConfig` and `RunnerEvent` |
@@ -99,7 +99,7 @@ let p = OpenAiProvider::new("https://api.openai.com/v1", "sk-...", "gpt-4o");
 // Azure OpenAI (auto-detected by endpoint)
 let p = OpenAiProvider::new("https://my-resource.openai.azure.com/...", "key", "gpt-4o");
 
-// Azure AI Foundry
+// Microsoft Foundry
 let p = OpenAiProvider::new("https://my-project.services.ai.azure.com/...", "key", "gpt-4o");
 
 // With options

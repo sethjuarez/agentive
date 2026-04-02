@@ -1,6 +1,6 @@
 //! OpenAI-compatible provider.
 //!
-//! Supports OpenAI, Azure OpenAI, Azure AI Foundry, and any endpoint
+//! Supports OpenAI, Azure OpenAI, Microsoft Foundry, and any endpoint
 //! that implements the `/chat/completions` SSE streaming protocol.
 
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use crate::types::*;
 
 /// OpenAI-compatible chat completion provider.
 ///
-/// Works with OpenAI, Azure OpenAI, Azure AI Foundry, and any endpoint
+/// Works with OpenAI, Azure OpenAI, Microsoft Foundry, and any endpoint
 /// that speaks the OpenAI chat completions SSE protocol.
 pub struct OpenAiProvider {
     endpoint: String,

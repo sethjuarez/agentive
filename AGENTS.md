@@ -21,7 +21,7 @@ lib/src/
 ├── provider.rs             # Provider trait definition
 ├── providers/
 │   ├── mod.rs              # Module declarations
-│   ├── openai.rs           # OpenAI-compatible provider (OpenAI, Azure, Foundry)
+│   ├── openai.rs           # OpenAI-compatible provider (OpenAI, Azure, Microsoft Foundry)
 │   ├── anthropic.rs        # Anthropic Messages API provider
 │   └── sse.rs              # Shared SSE line parser
 ├── runner.rs               # Agentic loop: run() function
