@@ -204,6 +204,37 @@ pub struct ToolFunction {
 
 // -- Requests & responses ----------------------------------------------------
 
+/// Structured output format specification.
+///
+/// Used to constrain the LLM's response to a specific JSON format.
+/// OpenAI supports this natively via `response_format`. Anthropic achieves
+/// similar results through tool-use patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ResponseFormat {
+    /// Request raw JSON output (no specific schema).
+    #[serde(rename = "json_object")]
+    JsonObject,
+    /// Request JSON output conforming to a specific schema.
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        /// Schema definition with name and strict mode.
+        json_schema: JsonSchemaSpec,
+    },
+}
+
+/// JSON schema specification for structured output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonSchemaSpec {
+    /// Name for the schema (used by the API for identification).
+    pub name: String,
+    /// Whether to enforce strict schema adherence.
+    #[serde(default)]
+    pub strict: bool,
+    /// The JSON Schema definition.
+    pub schema: serde_json::Value,
+}
+
 /// A chat completion request.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
@@ -212,6 +243,9 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
     pub stream: bool,
+    /// Optional structured output format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// A chat completion response.
@@ -391,9 +425,40 @@ mod tests {
             model: "gpt-4o".into(),
             tools: None,
             stream: true,
+            response_format: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream"], true);
         assert!(json.get("tools").is_none());
+        assert!(json.get("response_format").is_none());
+    }
+
+    #[test]
+    fn test_response_format_json_object() {
+        let rf = ResponseFormat::JsonObject;
+        let json = serde_json::to_value(&rf).unwrap();
+        assert_eq!(json["type"], "json_object");
+    }
+
+    #[test]
+    fn test_response_format_json_schema() {
+        let rf = ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaSpec {
+                name: "my_schema".into(),
+                strict: true,
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "answer": { "type": "string" }
+                    },
+                    "required": ["answer"]
+                }),
+            },
+        };
+        let json = serde_json::to_value(&rf).unwrap();
+        assert_eq!(json["type"], "json_schema");
+        assert_eq!(json["json_schema"]["name"], "my_schema");
+        assert_eq!(json["json_schema"]["strict"], true);
+        assert_eq!(json["json_schema"]["schema"]["type"], "object");
     }
 }

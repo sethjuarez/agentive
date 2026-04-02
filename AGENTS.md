@@ -129,6 +129,7 @@ pub async fn run<F, E>(
 - `auto_trim_context: true` — trim old messages when over budget
 - `sanitize_tool_results: true` — strip control chars and base64
 - `parallel_tool_calls: true` — execute multiple tool calls concurrently
+- `response_format: None` — optional structured output (JSON mode or JSON schema)
 
 ### RunnerResult
 - `messages: Vec<ChatMessage>` — full conversation history
@@ -304,6 +305,40 @@ When the LLM returns multiple tool calls in a single response and
 execute concurrently using scoped threads. Set to `false` for sequential
 execution if your tools share mutable state.
 
+## Structured output (types.rs)
+
+Force the LLM to return structured JSON instead of free-form text:
+
+```rust
+use agentive::{RunnerConfig, ResponseFormat, JsonSchemaSpec};
+
+// Simple JSON mode (no specific schema)
+let config = RunnerConfig {
+    response_format: Some(ResponseFormat::JsonObject),
+    ..Default::default()
+};
+
+// Strict JSON schema
+let config = RunnerConfig {
+    response_format: Some(ResponseFormat::JsonSchema {
+        json_schema: JsonSchemaSpec {
+            name: "extraction".into(),
+            strict: true,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": { "answer": { "type": "string" } },
+                "required": ["answer"]
+            }),
+        },
+    }),
+    ..Default::default()
+};
+```
+
+OpenAI/Microsoft Foundry: sent natively as `response_format` in the request body.
+Anthropic: pass-through (Anthropic doesn't have native `response_format` yet — use
+system prompt instructions or tool-use patterns for structured output).
+
 ## Usage tracking
 
 `RunnerResult::total_usage` accumulates `prompt_tokens`,
@@ -332,7 +367,7 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 63 tests
+cargo test           # run all 65 tests
 cargo doc --no-deps  # generate documentation
 ```
 

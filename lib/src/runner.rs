@@ -57,6 +57,8 @@ pub struct RunnerConfig {
     pub sanitize_tool_results: bool,
     /// Whether to execute multiple tool calls concurrently (default: true).
     pub parallel_tool_calls: bool,
+    /// Optional structured output format (JSON mode or JSON schema).
+    pub response_format: Option<ResponseFormat>,
 }
 
 impl Default for RunnerConfig {
@@ -67,6 +69,7 @@ impl Default for RunnerConfig {
             auto_trim_context: true,
             sanitize_tool_results: true,
             parallel_tool_calls: true,
+            response_format: None,
         }
     }
 }
@@ -191,6 +194,7 @@ where
                 Some(tools.clone())
             },
             stream: true,
+            response_format: config.response_format.clone(),
         };
 
         // Spawn provider in a separate task for concurrent streaming
@@ -255,6 +259,7 @@ where
                             Some(tools.clone())
                         },
                         stream: true,
+                        response_format: config.response_format.clone(),
                     };
 
                     let (tx2, mut rx2) = mpsc::channel::<ChatEvent>(64);

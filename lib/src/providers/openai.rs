@@ -74,12 +74,18 @@ impl Provider for OpenAiProvider {
         tx: mpsc::Sender<ChatEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": request.messages,
             "stream": true,
             "tools": request.tools,
         });
+
+        // Add response_format if specified
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = serde_json::to_value(rf)
+                .map_err(|e| AgentError::Stream(format!("Failed to serialize response_format: {}", e)))?;
+        }
 
         let mut req = self.client.post(self.chat_url()).json(&body);
         if self.is_azure() {

@@ -417,6 +417,7 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             tools: None,
             stream: true,
+            response_format: None,
         };
 
         let (system, messages, tools) = provider.prepare_request(&request);
@@ -448,6 +449,7 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             tools: None,
             stream: true,
+            response_format: None,
         };
 
         let (_, messages, _) = provider.prepare_request(&request);
@@ -476,6 +478,7 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             tools: None,
             stream: true,
+            response_format: None,
         };
 
         let (_, messages, _) = provider.prepare_request(&request);
