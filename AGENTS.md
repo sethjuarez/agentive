@@ -19,6 +19,7 @@ lib/src/
 ├── error.rs                # AgentError enum
 ├── cancel.rs               # CancellationToken (Arc<AtomicBool> wrapper)
 ├── provider.rs             # Provider trait definition
+├── steering.rs             # Steering — inject user messages mid-run
 ├── providers/
 │   ├── mod.rs              # Module declarations
 │   ├── openai.rs           # OpenAI-compatible provider (OpenAI, Azure, Microsoft Foundry)
@@ -114,6 +115,7 @@ pub async fn run<F, E>(
     tool_executor: F,                // closure: &ToolCall -> Result<String, String>
     config: RunnerConfig,            // max_iterations, retry, trimming, sanitization
     cancel: CancellationToken,       // for user-initiated stop
+    steering: Steering,              // inject user messages mid-loop
     on_event: E,                     // callback for RunnerEvent
 ) -> Result<RunnerResult, AgentError>
 ```
@@ -186,6 +188,29 @@ When conversations exceed the provider's `context_budget_chars()`:
 The summary is string-based (no LLM call) — extracts user requests, assistant
 decisions, and tool call names. Apps can upgrade to LLM-powered summarization
 by handling `RunnerEvent::MessagesUpdated` and replacing the summary.
+
+## Steering (steering.rs)
+
+Steering allows users to inject additional messages while the agent is in its
+tool-call loop. This is useful for "redirect" scenarios — the user sees the agent
+working and wants to nudge it in a different direction before it finishes.
+
+```rust
+let steering = Steering::new();
+let handle = steering.clone(); // Arc-based — cheap clone
+
+// From UI thread (can be called any time, including during run):
+handle.send("Also check the error handling path");
+
+// Pass into run() — runner drains queued messages before each LLM call:
+let result = run(provider, messages, tools, executor, config, cancel, steering, |_| {}).await?;
+```
+
+- `Steering::new()` — creates an empty queue
+- `steering.clone()` — shares the queue (uses `Arc<Mutex<Vec<String>>>`)
+- `steering.send(msg)` — enqueue a user message (pub)
+- Messages are drained and appended as `ChatMessage::user()` at the top of each
+  iteration, before the LLM call. If no messages are queued, nothing happens.
 
 ## Tool execution pattern
 

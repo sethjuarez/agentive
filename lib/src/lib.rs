@@ -5,7 +5,7 @@
 //!
 //! ## Quick Start
 //! ```no_run
-//! use agentive::{OpenAiProvider, RunnerConfig, CancellationToken, ChatMessage};
+//! use agentive::{OpenAiProvider, RunnerConfig, CancellationToken, Steering, ChatMessage};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), agentive::AgentError> {
@@ -22,6 +22,7 @@
 //!     |_call| Ok("tool not implemented".into()),
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
+//!     Steering::new(),
 //!     |_event| {},
 //! ).await?;
 //! # Ok(())
@@ -35,6 +36,7 @@ pub mod provider;
 pub mod providers;
 pub mod runner;
 pub mod sanitize;
+pub mod steering;
 pub mod types;
 
 pub use cancel::CancellationToken;
@@ -43,4 +45,5 @@ pub use provider::Provider;
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::openai::OpenAiProvider;
 pub use runner::{run, RunnerConfig, RunnerEvent, RunnerResult};
+pub use steering::Steering;
 pub use types::*;

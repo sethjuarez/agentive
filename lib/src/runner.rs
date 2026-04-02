@@ -23,6 +23,7 @@
 //!     |_call| Ok("not implemented".into()),
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
+//!     Steering::new(),
 //!     |event| { /* handle events */ },
 //! ).await?;
 //! # Ok(())
@@ -38,6 +39,7 @@ use crate::context::trim_to_context_window;
 use crate::error::AgentError;
 use crate::provider::Provider;
 use crate::sanitize::sanitize_for_api;
+use crate::steering::Steering;
 use crate::types::*;
 
 /// Configuration for the runner.
@@ -109,6 +111,7 @@ pub struct RunnerResult {
 /// * `tool_executor` - Closure that executes a tool call and returns the result.
 /// * `config` - Runner configuration.
 /// * `cancel` - Cancellation token for user-initiated stop.
+/// * `steering` - Handle for injecting user messages mid-run (see [`Steering`]).
 /// * `on_event` - Callback for runner events (streaming tokens, status, etc.).
 pub async fn run<F, E>(
     provider: Arc<dyn Provider>,
@@ -117,6 +120,7 @@ pub async fn run<F, E>(
     tool_executor: F,
     config: RunnerConfig,
     cancel: CancellationToken,
+    steering: Steering,
     on_event: E,
 ) -> Result<RunnerResult, AgentError>
 where
@@ -129,6 +133,12 @@ where
     for iteration in 0..config.max_iterations {
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
+        }
+
+        // Drain any steering messages injected by the user mid-run
+        for msg in steering.drain() {
+            full_messages.push(ChatMessage::user(&msg));
+            new_messages.push(ChatMessage::user(&msg));
         }
 
         on_event(RunnerEvent::Status {
@@ -428,6 +438,7 @@ mod tests {
             |_| Ok("unused".into()),
             RunnerConfig::default(),
             CancellationToken::new(),
+            Steering::new(),
             move |event| {
                 events_clone.lock().unwrap().push(format!("{:?}", event));
             },
@@ -478,6 +489,7 @@ mod tests {
             },
             RunnerConfig::default(),
             CancellationToken::new(),
+            Steering::new(),
             |_| {},
         )
         .await
@@ -505,6 +517,7 @@ mod tests {
             |_| Ok("".into()),
             RunnerConfig::default(),
             cancel,
+            Steering::new(),
             |_| {},
         )
         .await;
@@ -542,10 +555,60 @@ mod tests {
                 ..Default::default()
             },
             CancellationToken::new(),
+            Steering::new(),
             |_| {},
         )
         .await;
 
         assert!(matches!(result, Err(AgentError::MaxIterations(3))));
+    }
+
+    #[tokio::test]
+    async fn test_steering_injects_messages() {
+        let provider = Arc::new(MockProvider::new(vec![
+            // First response: tool call
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "slow_tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            // Second response: final text (after steering message was injected)
+            ChatResponse {
+                message: ChatMessage::assistant("Got your redirect, here's the answer"),
+                usage: None,
+            },
+        ]));
+
+        let steering = Steering::new();
+
+        // Simulate user steering mid-run: inject before round 2
+        steering.send("Actually, focus on the error case");
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Do the thing")],
+            vec![Tool::function("slow_tool", "a tool", serde_json::json!({}))],
+            |_| Ok("tool result".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            steering,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Got your redirect, here's the answer");
+        // The steering message should be in the conversation history
+        let has_steering = result
+            .messages
+            .iter()
+            .any(|m| m.text() == Some("Actually, focus on the error case"));
+        assert!(has_steering, "Steering message should be in history");
     }
 }

@@ -84,7 +84,7 @@ async fn main() -> Result<(), agentive::AgentError> {
 | `providers::sse` | Shared SSE line parser |
 | `runner` | The agentic loop — `run()` function with `RunnerConfig` and `RunnerEvent` |
 | `context` | Context window trimming and conversation summarization |
-| `sanitize` | Clean tool results before sending to APIs |
+| `steering` | [`Steering`] — inject user messages into a running agent loop |
 | `cancel` | `CancellationToken` for cooperative cancellation |
 | `error` | `AgentError` — unified error type |
 
@@ -113,6 +113,21 @@ let p = OpenAiProvider::new("https://api.openai.com/v1", "sk-...", "gpt-4o")
 ```rust
 let p = AnthropicProvider::new("sk-ant-...", "claude-sonnet-4-20250514")
     .with_context_budget(200_000);
+```
+
+## Steering
+
+Steering lets users inject messages while the agent is mid-loop (e.g., "actually focus on the error case"). The runner drains queued messages before each LLM call:
+
+```rust
+let steering = Steering::new();
+let handle = steering.clone(); // give this to your UI thread
+
+// UI thread can call at any time:
+handle.send("Please also consider edge cases");
+
+// Pass steering into the runner
+let result = run(provider, messages, tools, executor, config, cancel, steering, |_| {}).await?;
 ```
 
 ## Runner events
