@@ -49,6 +49,7 @@ pub use parse::parse_tool_args;
 pub use provider::Provider;
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::openai::OpenAiProvider;
+pub use providers::responses::ResponsesProvider;
 pub use runner::{run, RunnerConfig, RunnerEvent, RunnerResult};
 pub use steering::Steering;
 pub use types::*;

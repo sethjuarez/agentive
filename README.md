@@ -80,6 +80,7 @@ async fn main() -> Result<(), agentive::AgentError> {
 | `types` | `ChatMessage`, `ToolCall`, `Tool`, `ChatRequest/Response`, `MessageContent` (multimodal) |
 | `provider` | `Provider` trait — implement this for custom LLM backends |
 | `providers::openai` | OpenAI, Azure OpenAI, Microsoft Foundry — any OpenAI-compatible endpoint |
+| `providers::responses` | OpenAI Responses API (`/v1/responses`) — newer endpoint format |
 | `providers::anthropic` | Anthropic Messages API with content block streaming |
 | `providers::sse` | Shared SSE line parser |
 | `runner` | The agentic loop — `run()` function with `RunnerConfig` and `RunnerEvent` |
@@ -115,6 +116,16 @@ let p = OpenAiProvider::new("https://api.openai.com/v1", "sk-...", "gpt-4o")
 ```rust
 let p = AnthropicProvider::new("sk-ant-...", "claude-sonnet-4-20250514")
     .with_context_budget(200_000);
+```
+
+### Responses API
+
+```rust
+// OpenAI Responses API (newer endpoint)
+let p = ResponsesProvider::new("https://api.openai.com", "sk-...", "gpt-4o");
+
+// Azure / Microsoft Foundry
+let p = ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
 ```
 
 ## Steering

@@ -25,6 +25,7 @@ lib/src/
 ├── providers/
 │   ├── mod.rs              # Module declarations
 │   ├── openai.rs           # OpenAI-compatible provider (OpenAI, Azure, Microsoft Foundry)
+│   ├── responses.rs        # OpenAI Responses API provider (/v1/responses)
 │   ├── anthropic.rs        # Anthropic Messages API provider
 │   └── sse.rs              # Shared SSE line parser
 ├── runner.rs               # Agentic loop: run() function
@@ -182,6 +183,22 @@ Handles Anthropic-specific concerns:
 - Tool calls sent as `tool_use` content blocks
 - Tool results sent as `tool_result` content blocks in user messages
 - `thinking_delta` events for extended thinking models
+
+### ResponsesProvider
+OpenAI Responses API (`/v1/responses`) — newer endpoint with different format:
+```rust
+ResponsesProvider::new(endpoint, api_key, model)
+    .with_context_budget(128_000)  // optional
+    .with_vision(true)             // optional
+```
+
+Key differences from Chat Completions:
+- System messages → `role: "developer"` input items
+- Tool calls → separate `function_call` input items (not nested in assistant)
+- Tool results → `function_call_output` input items
+- SSE events: `response.output_text.delta`, `response.output_item.added`,
+  `response.function_call_arguments.delta`, `response.completed`
+- Tool defs are flattened (no `function` wrapper)
 
 ## Context trimming (context.rs)
 
@@ -367,7 +384,7 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 65 tests
+cargo test           # run all 71 tests
 cargo doc --no-deps  # generate documentation
 ```
 
