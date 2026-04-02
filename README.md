@@ -85,6 +85,7 @@ async fn main() -> Result<(), agentive::AgentError> {
 | `runner` | The agentic loop — `run()` function with `RunnerConfig` and `RunnerEvent` |
 | `context` | Context window trimming and conversation summarization |
 | `steering` | [`Steering`] — inject user messages into a running agent loop |
+| `parse` | [`parse_tool_args`] — robust JSON parsing for LLM-generated tool arguments |
 | `cancel` | `CancellationToken` for cooperative cancellation |
 | `error` | `AgentError` — unified error type |
 

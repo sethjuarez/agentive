@@ -38,4 +38,8 @@ pub enum AgentError {
     /// Exceeded maximum tool-call iterations.
     #[error("Exceeded maximum tool iterations ({0})")]
     MaxIterations(usize),
+
+    /// A tool closure panicked during execution.
+    #[error("Tool '{name}' panicked: {message}")]
+    ToolPanic { name: String, message: String },
 }

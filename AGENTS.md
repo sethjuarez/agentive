@@ -20,6 +20,7 @@ lib/src/
 ├── cancel.rs               # CancellationToken (Arc<AtomicBool> wrapper)
 ├── provider.rs             # Provider trait definition
 ├── steering.rs             # Steering — inject user messages mid-run
+├── parse.rs                # Robust JSON argument parsing for LLM output
 ├── providers/
 │   ├── mod.rs              # Module declarations
 │   ├── openai.rs           # OpenAI-compatible provider (OpenAI, Azure, Microsoft Foundry)
@@ -125,11 +126,13 @@ pub async fn run<F, E>(
 - `retry_on_400: true` — retry once on HTTP 400
 - `auto_trim_context: true` — trim old messages when over budget
 - `sanitize_tool_results: true` — strip control chars and base64
+- `parallel_tool_calls: true` — execute multiple tool calls concurrently
 
 ### RunnerResult
 - `messages: Vec<ChatMessage>` — full conversation history
 - `response: String` — final assistant text
 - `new_messages: Vec<ChatMessage>` — only messages generated during this run
+- `total_usage: Usage` — accumulated token usage across all LLM calls
 
 ## Provider trait
 
@@ -229,6 +232,47 @@ Tools are app-specific. The runner accepts a closure:
 }
 ```
 
+## Robust argument parsing (parse.rs)
+
+LLMs sometimes produce malformed JSON in tool call arguments. Use
+`parse_tool_args()` instead of raw `serde_json::from_str()`:
+
+```rust
+use agentive::parse_tool_args;
+
+|call: &ToolCall| -> Result<String, String> {
+    let args = parse_tool_args(&call.function.arguments)
+        .map_err(|e| e.to_string())?;
+    // ... use args
+}
+```
+
+Strategies tried in order:
+1. Direct `serde_json::from_str`
+2. Strip markdown code fences (`\`\`\`json ... \`\`\``)
+3. Extract first `{...}` block with brace matching
+4. Strip trailing commas before `}` or `]`
+
+## Tool panic safety
+
+Tool closures are user code — if one panics, agentive catches it via
+`catch_unwind` and returns `AgentError::ToolPanic { name, message }`
+instead of crashing the whole runtime. No special handling needed from the
+consuming app; the error propagates normally from `run()`.
+
+## Parallel tool execution
+
+When the LLM returns multiple tool calls in a single response and
+`RunnerConfig::parallel_tool_calls` is `true` (the default), tool calls
+execute concurrently using scoped threads. Set to `false` for sequential
+execution if your tools share mutable state.
+
+## Usage tracking
+
+`RunnerResult::total_usage` accumulates `prompt_tokens`,
+`completion_tokens`, and `total_tokens` across all LLM calls in a run.
+Each individual call also emits `RunnerEvent::Usage { usage }`.
+
 ## Persistence pattern
 
 Agentive does NOT own persistence. Apps handle it via events:
@@ -251,7 +295,7 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 35 tests
+cargo test           # run all 55 tests
 cargo doc --no-deps  # generate documentation
 ```
 

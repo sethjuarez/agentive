@@ -32,6 +32,7 @@
 pub mod cancel;
 pub mod context;
 pub mod error;
+pub mod parse;
 pub mod provider;
 pub mod providers;
 pub mod runner;
@@ -41,6 +42,7 @@ pub mod types;
 
 pub use cancel::CancellationToken;
 pub use error::AgentError;
+pub use parse::parse_tool_args;
 pub use provider::Provider;
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::openai::OpenAiProvider;

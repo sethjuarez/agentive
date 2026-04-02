@@ -53,6 +53,8 @@ pub struct RunnerConfig {
     pub auto_trim_context: bool,
     /// Whether to sanitize tool results (strip control chars, base64).
     pub sanitize_tool_results: bool,
+    /// Whether to execute multiple tool calls concurrently (default: true).
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for RunnerConfig {
@@ -62,6 +64,7 @@ impl Default for RunnerConfig {
             retry_on_400: true,
             auto_trim_context: true,
             sanitize_tool_results: true,
+            parallel_tool_calls: true,
         }
     }
 }
@@ -80,6 +83,8 @@ pub enum RunnerEvent {
     ToolCallStart { name: String, arguments: String },
     /// A tool returned a result.
     ToolResult { name: String, result: String },
+    /// Token usage for a single LLM call.
+    Usage { usage: Usage },
     /// The full message history was updated (after a tool round).
     /// Apps can use this to persist conversation state mid-run.
     MessagesUpdated { messages: Vec<ChatMessage> },
@@ -100,6 +105,8 @@ pub struct RunnerResult {
     pub response: String,
     /// New messages generated during this run (for persistence).
     pub new_messages: Vec<ChatMessage>,
+    /// Total token usage across all LLM calls in this run.
+    pub total_usage: Usage,
 }
 
 /// Run the agentic loop: stream LLM → execute tools → loop until done.
@@ -129,6 +136,7 @@ where
 {
     let mut full_messages = messages;
     let mut new_messages: Vec<ChatMessage> = Vec::new();
+    let mut total_usage = Usage::default();
 
     for iteration in 0..config.max_iterations {
         if cancel.is_cancelled() {
@@ -295,6 +303,14 @@ where
             AgentError::Stream("Provider finished without sending Done event".into())
         })?;
 
+        // Track usage
+        if let Some(usage) = &response.usage {
+            total_usage += usage.clone();
+            on_event(RunnerEvent::Usage {
+                usage: usage.clone(),
+            });
+        }
+
         // Check for tool calls
         if let Some(ref tool_calls) = response.message.tool_calls {
             if !tool_calls.is_empty() && !tools.is_empty() {
@@ -306,27 +322,16 @@ where
                     message: format!("Running {} tool call(s)…", tool_calls.len()),
                 });
 
-                // Execute each tool call
-                for tc in tool_calls {
-                    let result = match tool_executor(tc) {
-                        Ok(r) => r,
-                        Err(e) => format!("Tool error: {}", e),
-                    };
+                // Execute tool calls (parallel or sequential)
+                let tool_results = if config.parallel_tool_calls && tool_calls.len() > 1 {
+                    execute_tools_parallel(tool_calls, &tool_executor, &config, &on_event)?
+                } else {
+                    execute_tools_sequential(tool_calls, &tool_executor, &config, &on_event)?
+                };
 
-                    let clean_result = if config.sanitize_tool_results {
-                        sanitize_for_api(&result)
-                    } else {
-                        result.clone()
-                    };
-
-                    on_event(RunnerEvent::ToolResult {
-                        name: tc.function.name.clone(),
-                        result: clean_result.clone(),
-                    });
-
-                    let tool_msg = ChatMessage::tool_result(&tc.id, &clean_result);
+                for tool_msg in &tool_results {
                     full_messages.push(tool_msg.clone());
-                    new_messages.push(tool_msg);
+                    new_messages.push(tool_msg.clone());
                 }
 
                 // Emit updated messages for persistence
@@ -357,10 +362,113 @@ where
             messages: full_messages,
             response: final_text,
             new_messages,
+            total_usage,
         });
     }
 
     Err(AgentError::MaxIterations(config.max_iterations))
+}
+
+/// Execute tool calls sequentially with panic safety.
+fn execute_tools_sequential<F, E>(
+    tool_calls: &[ToolCall],
+    tool_executor: &F,
+    config: &RunnerConfig,
+    on_event: &E,
+) -> Result<Vec<ChatMessage>, AgentError>
+where
+    F: Fn(&ToolCall) -> Result<String, String> + Send + Sync,
+    E: Fn(RunnerEvent) + Send + Sync,
+{
+    let mut results = Vec::with_capacity(tool_calls.len());
+    for tc in tool_calls {
+        let raw_result = execute_tool_safe(tc, tool_executor)?;
+        let clean = if config.sanitize_tool_results {
+            sanitize_for_api(&raw_result)
+        } else {
+            raw_result
+        };
+        on_event(RunnerEvent::ToolResult {
+            name: tc.function.name.clone(),
+            result: clean.clone(),
+        });
+        results.push(ChatMessage::tool_result(&tc.id, &clean));
+    }
+    Ok(results)
+}
+
+/// Execute tool calls in parallel with panic safety.
+fn execute_tools_parallel<F, E>(
+    tool_calls: &[ToolCall],
+    tool_executor: &F,
+    config: &RunnerConfig,
+    on_event: &E,
+) -> Result<Vec<ChatMessage>, AgentError>
+where
+    F: Fn(&ToolCall) -> Result<String, String> + Send + Sync,
+    E: Fn(RunnerEvent) + Send + Sync,
+{
+    // Use std threads for parallel execution since tool_executor is Fn (sync)
+    let results: Vec<Result<(String, String, String), AgentError>> = std::thread::scope(|s| {
+        let handles: Vec<_> = tool_calls
+            .iter()
+            .map(|tc| {
+                let name = tc.function.name.clone();
+                let id = tc.id.clone();
+                s.spawn(move || {
+                    let raw = execute_tool_safe(tc, tool_executor)?;
+                    Ok((id, name, raw))
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(AgentError::Stream("Thread panicked".into()))))
+            .collect()
+    });
+
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for res in results {
+        let (id, name, raw) = res?;
+        let clean = if config.sanitize_tool_results {
+            sanitize_for_api(&raw)
+        } else {
+            raw
+        };
+        on_event(RunnerEvent::ToolResult {
+            name,
+            result: clean.clone(),
+        });
+        messages.push(ChatMessage::tool_result(&id, &clean));
+    }
+    Ok(messages)
+}
+
+/// Execute a single tool call with panic safety via `catch_unwind`.
+fn execute_tool_safe<F>(tc: &ToolCall, tool_executor: &F) -> Result<String, AgentError>
+where
+    F: Fn(&ToolCall) -> Result<String, String>,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool_executor(tc)));
+
+    match result {
+        Ok(Ok(r)) => Ok(r),
+        Ok(Err(e)) => Ok(format!("Tool error: {}", e)),
+        Err(panic_info) => {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            Err(AgentError::ToolPanic {
+                name: tc.function.name.clone(),
+                message: panic_msg,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -610,5 +718,169 @@ mod tests {
             .iter()
             .any(|m| m.text() == Some("Actually, focus on the error case"));
         assert!(has_steering, "Steering message should be in history");
+    }
+
+    #[tokio::test]
+    async fn test_usage_accumulation() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "tool1".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: Some(Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 20,
+                    total_tokens: 120,
+                }),
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("done"),
+                usage: Some(Usage {
+                    prompt_tokens: 200,
+                    completion_tokens: 30,
+                    total_tokens: 230,
+                }),
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("go")],
+            vec![Tool::function("tool1", "a tool", serde_json::json!({}))],
+            |_| Ok("ok".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.total_usage.prompt_tokens, 300);
+        assert_eq!(result.total_usage.completion_tokens, 50);
+        assert_eq!(result.total_usage.total_tokens, 350);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tool_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "tool_a".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "tool_b".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "tool_c".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                ]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("All done"),
+                usage: None,
+            },
+        ]));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = call_count.clone();
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("run three tools")],
+            vec![
+                Tool::function("tool_a", "a", serde_json::json!({})),
+                Tool::function("tool_b", "b", serde_json::json!({})),
+                Tool::function("tool_c", "c", serde_json::json!({})),
+            ],
+            move |tc| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("result from {}", tc.function.name))
+            },
+            RunnerConfig {
+                parallel_tool_calls: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "All done");
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        // Should have tool results in the conversation
+        let tool_results: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(tool_results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_tool_panic_safety() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "panicking_tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("call the bad tool")],
+            vec![Tool::function(
+                "panicking_tool",
+                "panics",
+                serde_json::json!({}),
+            )],
+            |_| panic!("tool went boom"),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::ToolPanic { name, message }) => {
+                assert_eq!(name, "panicking_tool");
+                assert!(message.contains("tool went boom"));
+            }
+            other => panic!("Expected ToolPanic, got: {:?}", other.err()),
+        }
     }
 }

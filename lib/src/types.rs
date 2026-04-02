@@ -223,11 +223,27 @@ pub struct ChatResponse {
 }
 
 /// Token usage statistics from the API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.prompt_tokens += rhs.prompt_tokens;
+        self.completion_tokens += rhs.completion_tokens;
+        self.total_tokens += rhs.total_tokens;
+    }
+}
+
+impl std::ops::Add for Usage {
+    type Output = Self;
+    fn add(mut self, rhs: Self) -> Self {
+        self += rhs;
+        self
+    }
 }
 
 // -- Streaming events --------------------------------------------------------
