@@ -5,7 +5,7 @@
 //!
 //! ## Quick Start
 //! ```no_run
-//! use agentive::{OpenAiProvider, RunnerConfig, CancellationToken, Steering, ChatMessage};
+//! use agentive::{OpenAiProvider, RunnerConfig, CancellationToken, Steering, Guardrails, ChatMessage};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), agentive::AgentError> {
@@ -23,6 +23,7 @@
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
 //!     Steering::new(),
+//!     Guardrails::default(),
 //!     |_event| {},
 //! ).await?;
 //! # Ok(())
@@ -32,6 +33,7 @@
 pub mod cancel;
 pub mod context;
 pub mod error;
+pub mod guardrails;
 pub mod parse;
 pub mod provider;
 pub mod providers;
@@ -42,6 +44,7 @@ pub mod types;
 
 pub use cancel::CancellationToken;
 pub use error::AgentError;
+pub use guardrails::{GuardrailResult, Guardrails};
 pub use parse::parse_tool_args;
 pub use provider::Provider;
 pub use providers::anthropic::AnthropicProvider;

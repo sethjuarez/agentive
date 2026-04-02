@@ -21,6 +21,7 @@ lib/src/
 ├── provider.rs             # Provider trait definition
 ├── steering.rs             # Steering — inject user messages mid-run
 ├── parse.rs                # Robust JSON argument parsing for LLM output
+├── guardrails.rs           # Input/output/tool guardrails (validation hooks)
 ├── providers/
 │   ├── mod.rs              # Module declarations
 │   ├── openai.rs           # OpenAI-compatible provider (OpenAI, Azure, Microsoft Foundry)
@@ -117,6 +118,7 @@ pub async fn run<F, E>(
     config: RunnerConfig,            // max_iterations, retry, trimming, sanitization
     cancel: CancellationToken,       // for user-initiated stop
     steering: Steering,              // inject user messages mid-loop
+    guardrails: Guardrails,          // input/output/tool validation hooks
     on_event: E,                     // callback for RunnerEvent
 ) -> Result<RunnerResult, AgentError>
 ```
@@ -232,6 +234,41 @@ Tools are app-specific. The runner accepts a closure:
 }
 ```
 
+## Guardrails (guardrails.rs)
+
+Guardrails are optional validation hooks at three points in the runner loop:
+
+```rust
+use agentive::{Guardrails, GuardrailResult};
+
+let guardrails = Guardrails::new()
+    .with_input_guardrail(|messages| {
+        // Check messages before each LLM call
+        GuardrailResult::Allow
+    })
+    .with_output_guardrail(|assistant_msg| {
+        // Check LLM response before processing
+        if assistant_msg.text().unwrap_or("").contains("SECRET") {
+            GuardrailResult::Deny("Output contains secrets".into())
+        } else {
+            GuardrailResult::Allow
+        }
+    })
+    .with_tool_guardrail(|tool_call| {
+        // Check before each tool execution
+        if tool_call.function.name == "dangerous_tool" {
+            GuardrailResult::Deny("Tool not permitted".into())
+        } else {
+            GuardrailResult::Allow
+        }
+    });
+```
+
+- `GuardrailResult::Allow` — proceed normally
+- `GuardrailResult::Deny(reason)` — for input/output: abort with `AgentError::Guardrailed`;
+  for tools: returns the denial message as the tool result (loop continues)
+- Pass `Guardrails::default()` for no guardrails
+
 ## Robust argument parsing (parse.rs)
 
 LLMs sometimes produce malformed JSON in tool call arguments. Use
@@ -295,7 +332,7 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 55 tests
+cargo test           # run all 63 tests
 cargo doc --no-deps  # generate documentation
 ```
 

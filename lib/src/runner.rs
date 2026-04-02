@@ -24,6 +24,7 @@
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
 //!     Steering::new(),
+//!     Guardrails::default(),
 //!     |event| { /* handle events */ },
 //! ).await?;
 //! # Ok(())
@@ -37,6 +38,7 @@ use tokio::sync::mpsc;
 use crate::cancel::CancellationToken;
 use crate::context::trim_to_context_window;
 use crate::error::AgentError;
+use crate::guardrails::{GuardrailResult, Guardrails};
 use crate::provider::Provider;
 use crate::sanitize::sanitize_for_api;
 use crate::steering::Steering;
@@ -98,6 +100,7 @@ pub enum RunnerEvent {
 }
 
 /// Result of running the agentic loop.
+#[derive(Debug)]
 pub struct RunnerResult {
     /// The full conversation including tool calls and results.
     pub messages: Vec<ChatMessage>,
@@ -119,6 +122,7 @@ pub struct RunnerResult {
 /// * `config` - Runner configuration.
 /// * `cancel` - Cancellation token for user-initiated stop.
 /// * `steering` - Handle for injecting user messages mid-run (see [`Steering`]).
+/// * `guardrails` - Optional validation hooks (see [`Guardrails`]).
 /// * `on_event` - Callback for runner events (streaming tokens, status, etc.).
 pub async fn run<F, E>(
     provider: Arc<dyn Provider>,
@@ -128,6 +132,7 @@ pub async fn run<F, E>(
     config: RunnerConfig,
     cancel: CancellationToken,
     steering: Steering,
+    guardrails: Guardrails,
     on_event: E,
 ) -> Result<RunnerResult, AgentError>
 where
@@ -169,6 +174,11 @@ where
                     ),
                 });
             }
+        }
+
+        // Input guardrail — check before calling LLM
+        if let GuardrailResult::Deny(reason) = guardrails.check_input(&full_messages) {
+            return Err(AgentError::Guardrailed(reason));
         }
 
         // Build request
@@ -311,6 +321,11 @@ where
             });
         }
 
+        // Output guardrail — check LLM response before proceeding
+        if let GuardrailResult::Deny(reason) = guardrails.check_output(&response.message) {
+            return Err(AgentError::Guardrailed(reason));
+        }
+
         // Check for tool calls
         if let Some(ref tool_calls) = response.message.tool_calls {
             if !tool_calls.is_empty() && !tools.is_empty() {
@@ -324,9 +339,9 @@ where
 
                 // Execute tool calls (parallel or sequential)
                 let tool_results = if config.parallel_tool_calls && tool_calls.len() > 1 {
-                    execute_tools_parallel(tool_calls, &tool_executor, &config, &on_event)?
+                    execute_tools_parallel(tool_calls, &tool_executor, &config, &guardrails, &on_event)?
                 } else {
-                    execute_tools_sequential(tool_calls, &tool_executor, &config, &on_event)?
+                    execute_tools_sequential(tool_calls, &tool_executor, &config, &guardrails, &on_event)?
                 };
 
                 for tool_msg in &tool_results {
@@ -369,11 +384,12 @@ where
     Err(AgentError::MaxIterations(config.max_iterations))
 }
 
-/// Execute tool calls sequentially with panic safety.
+/// Execute tool calls sequentially with panic safety and guardrails.
 fn execute_tools_sequential<F, E>(
     tool_calls: &[ToolCall],
     tool_executor: &F,
     config: &RunnerConfig,
+    guardrails: &Guardrails,
     on_event: &E,
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
@@ -382,6 +398,17 @@ where
 {
     let mut results = Vec::with_capacity(tool_calls.len());
     for tc in tool_calls {
+        // Tool guardrail — check before execution
+        if let GuardrailResult::Deny(reason) = guardrails.check_tool(tc) {
+            let denied_msg = format!("Tool denied by guardrail: {}", reason);
+            on_event(RunnerEvent::ToolResult {
+                name: tc.function.name.clone(),
+                result: denied_msg.clone(),
+            });
+            results.push(ChatMessage::tool_result(&tc.id, &denied_msg));
+            continue;
+        }
+
         let raw_result = execute_tool_safe(tc, tool_executor)?;
         let clean = if config.sanitize_tool_results {
             sanitize_for_api(&raw_result)
@@ -397,11 +424,12 @@ where
     Ok(results)
 }
 
-/// Execute tool calls in parallel with panic safety.
+/// Execute tool calls in parallel with panic safety and guardrails.
 fn execute_tools_parallel<F, E>(
     tool_calls: &[ToolCall],
     tool_executor: &F,
     config: &RunnerConfig,
+    guardrails: &Guardrails,
     on_event: &E,
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
@@ -415,9 +443,20 @@ where
             .map(|tc| {
                 let name = tc.function.name.clone();
                 let id = tc.id.clone();
+
+                // Tool guardrail check (runs in main thread before spawning)
+                let denied = match guardrails.check_tool(tc) {
+                    GuardrailResult::Deny(reason) => Some(reason),
+                    GuardrailResult::Allow => None,
+                };
+
                 s.spawn(move || {
-                    let raw = execute_tool_safe(tc, tool_executor)?;
-                    Ok((id, name, raw))
+                    if let Some(reason) = denied {
+                        Ok((id, name, format!("Tool denied by guardrail: {}", reason)))
+                    } else {
+                        let raw = execute_tool_safe(tc, tool_executor)?;
+                        Ok((id, name, raw))
+                    }
                 })
             })
             .collect();
@@ -547,6 +586,7 @@ mod tests {
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
+            Guardrails::default(),
             move |event| {
                 events_clone.lock().unwrap().push(format!("{:?}", event));
             },
@@ -598,6 +638,7 @@ mod tests {
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
+            Guardrails::default(),
             |_| {},
         )
         .await
@@ -626,6 +667,7 @@ mod tests {
             RunnerConfig::default(),
             cancel,
             Steering::new(),
+            Guardrails::default(),
             |_| {},
         )
         .await;
@@ -664,6 +706,7 @@ mod tests {
             },
             CancellationToken::new(),
             Steering::new(),
+            Guardrails::default(),
             |_| {},
         )
         .await;
@@ -706,6 +749,7 @@ mod tests {
             RunnerConfig::default(),
             CancellationToken::new(),
             steering,
+            Guardrails::default(),
             |_| {},
         )
         .await
@@ -756,6 +800,7 @@ mod tests {
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
+            Guardrails::default(),
             |_| {},
         )
         .await
@@ -827,6 +872,7 @@ mod tests {
             },
             CancellationToken::new(),
             Steering::new(),
+            Guardrails::default(),
             |_| {},
         )
         .await
@@ -871,6 +917,7 @@ mod tests {
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
+            Guardrails::default(),
             |_| {},
         )
         .await;
@@ -881,6 +928,144 @@ mod tests {
                 assert!(message.contains("tool went boom"));
             }
             other => panic!("Expected ToolPanic, got: {:?}", other.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_input_guardrail_denies() {
+        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+            message: ChatMessage::assistant("should not reach"),
+            usage: None,
+        }]));
+
+        let guardrails = Guardrails::new().with_input_guardrail(|_msgs| {
+            GuardrailResult::Deny("Blocked by policy".into())
+        });
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hello")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            guardrails,
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Guardrailed(reason)) => {
+                assert_eq!(reason, "Blocked by policy");
+            }
+            other => panic!("Expected Guardrailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_guardrail_denies_specific_tool() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "safe_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "dangerous_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                ]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("Finished"),
+                usage: None,
+            },
+        ]));
+
+        let guardrails = Guardrails::new().with_tool_guardrail(|tc| {
+            if tc.function.name == "dangerous_tool" {
+                GuardrailResult::Deny("Tool not permitted".into())
+            } else {
+                GuardrailResult::Allow
+            }
+        });
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("do it")],
+            vec![
+                Tool::function("safe_tool", "safe", serde_json::json!({})),
+                Tool::function("dangerous_tool", "dangerous", serde_json::json!({})),
+            ],
+            |_| Ok("safe result".into()),
+            RunnerConfig {
+                parallel_tool_calls: false, // sequential so we can test order
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            guardrails,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Finished");
+        // The dangerous tool should have a denial message, not a real result
+        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 2);
+        let denied = tool_msgs
+            .iter()
+            .find(|m| m.text().unwrap_or("").contains("denied by guardrail"))
+            .expect("Should have a denied tool result");
+        assert!(denied.text().unwrap().contains("not permitted"));
+    }
+
+    #[tokio::test]
+    async fn test_output_guardrail_denies() {
+        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+            message: ChatMessage::assistant("Here is the SECRET_KEY: abc123"),
+            usage: None,
+        }]));
+
+        let guardrails = Guardrails::new().with_output_guardrail(|msg| {
+            if let Some(text) = msg.text() {
+                if text.contains("SECRET_KEY") {
+                    return GuardrailResult::Deny("Output contains secrets".into());
+                }
+            }
+            GuardrailResult::Allow
+        });
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("give me the key")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            guardrails,
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Guardrailed(reason)) => {
+                assert!(reason.contains("secrets"));
+            }
+            other => panic!("Expected Guardrailed, got: {:?}", other),
         }
     }
 }

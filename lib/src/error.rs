@@ -42,4 +42,8 @@ pub enum AgentError {
     /// A tool closure panicked during execution.
     #[error("Tool '{name}' panicked: {message}")]
     ToolPanic { name: String, message: String },
+
+    /// A guardrail denied the operation.
+    #[error("Guardrail denied: {0}")]
+    Guardrailed(String),
 }

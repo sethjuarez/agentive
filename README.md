@@ -86,6 +86,7 @@ async fn main() -> Result<(), agentive::AgentError> {
 | `context` | Context window trimming and conversation summarization |
 | `steering` | [`Steering`] — inject user messages into a running agent loop |
 | `parse` | [`parse_tool_args`] — robust JSON parsing for LLM-generated tool arguments |
+| `guardrails` | [`Guardrails`] — input/output/tool validation hooks with `Allow`/`Deny` |
 | `cancel` | `CancellationToken` for cooperative cancellation |
 | `error` | `AgentError` — unified error type |
 
