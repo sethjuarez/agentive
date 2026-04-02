@@ -148,7 +148,12 @@ fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
     } else {
-        &s[..max]
+        // Find a valid UTF-8 boundary at or before `max` bytes
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -222,5 +227,40 @@ mod tests {
         let input = r#"{"code": "fn main() { println!(\"hello\"); }"}"#;
         let v = parse_tool_args(input).unwrap();
         assert!(v["code"].as_str().unwrap().contains("fn main"));
+    }
+
+    #[test]
+    fn test_truncate_multibyte_utf8() {
+        // "héllo" has a 2-byte 'é' — byte-slicing at arbitrary positions would panic
+        let s = "héllo wörld";
+        let t = truncate(s, 3);
+        // 'h' is 1 byte, 'é' is 2 bytes = 3 bytes total, should get "hé"
+        assert_eq!(t, "hé");
+
+        // Truncate at 2 should back up to avoid splitting 'é'
+        let t2 = truncate(s, 2);
+        assert_eq!(t2, "h");
+    }
+
+    #[test]
+    fn test_truncate_emoji() {
+        let s = "🦀 Rust is great";
+        // 🦀 is 4 bytes. Truncating at 1, 2, or 3 should back up to 0
+        assert_eq!(truncate(s, 1), "");
+        assert_eq!(truncate(s, 2), "");
+        assert_eq!(truncate(s, 3), "");
+        assert_eq!(truncate(s, 4), "🦀");
+        assert_eq!(truncate(s, 5), "🦀 ");
+    }
+
+    #[test]
+    fn test_parse_error_with_multibyte_input() {
+        // Error message calls truncate on the raw input — should not panic
+        let input = "日本語のテキスト".repeat(50);
+        let result = parse_tool_args(&input);
+        assert!(result.is_err());
+        // The error message should be truncated without panicking
+        let err = result.unwrap_err();
+        assert!(err.contains("Failed to parse"));
     }
 }

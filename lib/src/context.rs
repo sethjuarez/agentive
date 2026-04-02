@@ -12,13 +12,26 @@ pub fn estimate_chars(msgs: &[ChatMessage]) -> usize {
             let content_len = m.content.as_ref().map_or(0, |c| c.char_len());
             let tool_len = m.tool_calls.as_ref().map_or(0, |tc| {
                 tc.iter()
-                    .map(|t| t.function.name.len() + t.function.arguments.len())
+                    .map(|t| t.function.name.chars().count() + t.function.arguments.chars().count())
                     .sum()
             });
-            let tool_id_len = m.tool_call_id.as_ref().map_or(0, |id| id.len());
+            let tool_id_len = m.tool_call_id.as_ref().map_or(0, |id| id.chars().count());
             content_len + tool_len + tool_id_len + 20 // overhead per message
         })
         .sum()
+}
+
+/// Truncate a string to at most `max` bytes on a valid UTF-8 boundary.
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
 }
 
 /// Build a compact string summary from messages that are about to be dropped.
@@ -31,13 +44,13 @@ pub fn summarize_dropped(dropped: &[ChatMessage]) -> String {
         match msg.role.as_str() {
             "user" => {
                 if let Some(text) = msg.text() {
-                    let truncated = if text.len() > 200 { &text[..200] } else { text };
+                    let truncated = truncate_str(text, 200);
                     parts.push(format!("• User asked: {truncated}"));
                 }
             }
             "assistant" => {
                 if let Some(text) = msg.text() {
-                    let truncated = if text.len() > 200 { &text[..200] } else { text };
+                    let truncated = truncate_str(text, 200);
                     parts.push(format!("• Assistant: {truncated}"));
                 }
                 if let Some(tool_calls) = &msg.tool_calls {
@@ -189,5 +202,49 @@ mod tests {
         // Summary should be inserted after system
         assert_eq!(msgs[1].role, "user");
         assert!(msgs[1].text().unwrap().contains("[Earlier conversation summary]"));
+    }
+
+    #[test]
+    fn test_summarize_multibyte_utf8() {
+        // Messages with CJK characters — should not panic on truncation
+        let long_text = "日本語のテキスト".repeat(50); // well over 200 bytes
+        let msgs = vec![
+            ChatMessage::user(&long_text),
+            ChatMessage::assistant(&long_text),
+        ];
+        let summary = summarize_dropped(&msgs);
+        assert!(summary.contains("User asked:"));
+        assert!(summary.contains("Assistant:"));
+        // No panic = success
+    }
+
+    #[test]
+    fn test_estimate_chars_multibyte() {
+        // 'é' is 2 bytes but 1 char; char_len should count chars now
+        let msgs = vec![ChatMessage::user("héllo")];
+        let chars = estimate_chars(&msgs);
+        // "héllo" = 5 chars + 20 overhead = 25
+        assert_eq!(chars, 25);
+    }
+
+    #[test]
+    fn test_trim_only_two_messages_over_budget() {
+        // Edge case: 2 non-system messages that exceed budget
+        let mut msgs = vec![
+            ChatMessage::user(&"x".repeat(5000)),
+            ChatMessage::assistant(&"y".repeat(5000)),
+        ];
+        // Budget smaller than content — trimming stops at 2 messages
+        let (dropped, _) = trim_to_context_window(&mut msgs, 100);
+        // Should not panic, may not be able to trim below budget
+        assert_eq!(dropped, 0); // can't drop below 2
+    }
+
+    #[test]
+    fn test_trim_empty_messages() {
+        let mut msgs: Vec<ChatMessage> = Vec::new();
+        let (dropped, _) = trim_to_context_window(&mut msgs, 100);
+        assert_eq!(dropped, 0);
+        assert!(msgs.is_empty());
     }
 }

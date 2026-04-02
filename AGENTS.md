@@ -226,7 +226,7 @@ let handle = steering.clone(); // Arc-based — cheap clone
 handle.send("Also check the error handling path");
 
 // Pass into run() — runner drains queued messages before each LLM call:
-let result = run(provider, messages, tools, executor, config, cancel, steering, |_| {}).await?;
+let result = run(provider, messages, tools, executor, config, cancel, steering, Guardrails::default(), |_| {}).await?;
 ```
 
 - `Steering::new()` — creates an empty queue
@@ -384,9 +384,22 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 71 tests
+cargo test           # run all 107 tests (unit + doc + integration stubs)
 cargo doc --no-deps  # generate documentation
 ```
+
+### Integration tests (real providers)
+
+Integration tests live in `lib/tests/integration.rs` and are **skipped by default**.
+They run end-to-end against real LLM APIs when environment variables are set:
+
+```bash
+cp .env.example .env
+# Edit .env with real API keys
+cargo test --manifest-path lib/Cargo.toml --test integration
+```
+
+Supported providers: OpenAI, Azure OpenAI, Anthropic.
 
 ## Consuming from another project
 

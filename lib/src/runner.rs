@@ -1073,4 +1073,544 @@ mod tests {
             other => panic!("Expected Guardrailed, got: {:?}", other),
         }
     }
+
+    // -- Error path tests --------------------------------------------------------
+
+    /// A mock provider that returns an error on the first call.
+    struct ErrorProvider {
+        error: Mutex<Option<AgentError>>,
+        fallback: Mutex<Vec<ChatResponse>>,
+    }
+
+    impl ErrorProvider {
+        fn with_error(error: AgentError) -> Self {
+            Self {
+                error: Mutex::new(Some(error)),
+                fallback: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_400_then_success(fallback_response: ChatResponse) -> Self {
+            Self {
+                error: Mutex::new(Some(AgentError::Api {
+                    status: 400,
+                    message: "Bad Request".into(),
+                })),
+                fallback: Mutex::new(vec![fallback_response]),
+            }
+        }
+
+        fn with_400_then_400() -> Self {
+            Self {
+                error: Mutex::new(Some(AgentError::Api {
+                    status: 400,
+                    message: "Bad Request".into(),
+                })),
+                fallback: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for ErrorProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+
+            // Return error on first call, then use fallback responses
+            let maybe_err = { self.error.lock().unwrap().take() };
+            if let Some(err) = maybe_err {
+                return Err(err);
+            }
+
+            let response = {
+                let mut fallback = self.fallback.lock().unwrap();
+                if fallback.is_empty() {
+                    return Err(AgentError::Api {
+                        status: 400,
+                        message: "Retry also failed".into(),
+                    });
+                }
+                fallback.remove(0)
+            };
+
+            if let Some(text) = response.message.text() {
+                for word in text.split_whitespace() {
+                    let _ = tx
+                        .send(ChatEvent::Token {
+                            token: format!("{} ", word),
+                        })
+                        .await;
+                }
+            }
+            let _ = tx.send(ChatEvent::Done { response }).await;
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "error_mock"
+        }
+    }
+
+    /// Mock provider that sends tokens but never sends Done event.
+    struct NoDoneProvider;
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for NoDoneProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            _cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            let _ = tx
+                .send(ChatEvent::Token {
+                    token: "partial".into(),
+                })
+                .await;
+            // Drop tx without sending Done
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "no_done_mock"
+        }
+    }
+
+    /// Mock provider that sends a ChatEvent::Error.
+    struct StreamErrorProvider;
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for StreamErrorProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            _cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            let _ = tx
+                .send(ChatEvent::Error {
+                    message: "Connection reset".into(),
+                })
+                .await;
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "stream_error_mock"
+        }
+    }
+
+    /// Mock provider that simulates slow streaming for mid-stream cancellation.
+    struct SlowStreamProvider;
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for SlowStreamProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            for i in 0..100 {
+                if cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
+                let _ = tx
+                    .send(ChatEvent::Token {
+                        token: format!("token{} ", i),
+                    })
+                    .await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            let _ = tx
+                .send(ChatEvent::Done {
+                    response: ChatResponse {
+                        message: ChatMessage::assistant("should not complete"),
+                        usage: None,
+                    },
+                })
+                .await;
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "slow_mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_non_400_error() {
+        let provider = Arc::new(ErrorProvider::with_error(AgentError::Api {
+            status: 500,
+            message: "Internal Server Error".into(),
+        }));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Api { status: 500, .. }) => {} // expected
+            other => panic!("Expected Api 500, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_400_retry_success() {
+        let provider = Arc::new(ErrorProvider::with_400_then_success(ChatResponse {
+            message: ChatMessage::assistant("Retry worked"),
+            usage: None,
+        }));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig {
+                retry_on_400: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Retry worked");
+    }
+
+    #[tokio::test]
+    async fn test_400_retry_fails() {
+        let provider = Arc::new(ErrorProvider::with_400_then_400());
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig {
+                retry_on_400: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Api { status: 400, .. }) => {} // expected
+            other => panic!("Expected Api 400 on retry, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_400_no_retry_when_disabled() {
+        let provider = Arc::new(ErrorProvider::with_error(AgentError::Api {
+            status: 400,
+            message: "Bad Request".into(),
+        }));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig {
+                retry_on_400: false,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Api { status: 400, .. }) => {} // expected
+            other => panic!("Expected immediate Api 400 error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_done_event() {
+        let provider = Arc::new(NoDoneProvider);
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Stream(msg)) => {
+                assert!(msg.contains("without sending Done"), "Got: {}", msg);
+            }
+            other => panic!("Expected Stream error for missing Done, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_event() {
+        let provider = Arc::new(StreamErrorProvider);
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::Stream(msg)) => {
+                assert!(msg.contains("Connection reset"), "Got: {}", msg);
+            }
+            other => panic!("Expected Stream error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mid_stream_cancellation() {
+        let provider = Arc::new(SlowStreamProvider);
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Cancel after a short delay (mid-stream)
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("Hi")],
+            vec![],
+            |_| Ok("".into()),
+            RunnerConfig::default(),
+            cancel,
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "Expected Cancelled, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_executor_returns_error() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "failing_tool".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("Handled the error"),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("go")],
+            vec![Tool::function("failing_tool", "fails", serde_json::json!({}))],
+            |_| Err("Something went wrong".into()),
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // Tool error should be sent as a tool result containing the error
+        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert!(tool_msgs[0].text().unwrap().contains("Tool error:"));
+        assert_eq!(result.response, "Handled the error");
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tool_guardrail_deny() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "allowed_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "blocked_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "allowed_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                ]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("Done with mixed results"),
+                usage: None,
+            },
+        ]));
+
+        let guardrails = Guardrails::new().with_tool_guardrail(|tc| {
+            if tc.function.name == "blocked_tool" {
+                GuardrailResult::Deny("Not allowed in parallel".into())
+            } else {
+                GuardrailResult::Allow
+            }
+        });
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("run three tools")],
+            vec![
+                Tool::function("allowed_tool", "ok", serde_json::json!({})),
+                Tool::function("blocked_tool", "nope", serde_json::json!({})),
+            ],
+            |_| Ok("tool succeeded".into()),
+            RunnerConfig {
+                parallel_tool_calls: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            guardrails,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 3);
+
+        // Exactly one should be denied
+        let denied: Vec<_> = tool_msgs
+            .iter()
+            .filter(|m| m.text().unwrap_or("").contains("denied by guardrail"))
+            .collect();
+        assert_eq!(denied.len(), 1);
+        assert!(denied[0].text().unwrap().contains("Not allowed in parallel"));
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tool_panic_one_of_many() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "good_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "bad_tool".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                ]),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("go")],
+            vec![
+                Tool::function("good_tool", "good", serde_json::json!({})),
+                Tool::function("bad_tool", "panics", serde_json::json!({})),
+            ],
+            |tc| {
+                if tc.function.name == "bad_tool" {
+                    panic!("parallel panic test");
+                }
+                Ok("good result".into())
+            },
+            RunnerConfig {
+                parallel_tool_calls: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await;
+
+        match result {
+            Err(AgentError::ToolPanic { name, message }) => {
+                assert_eq!(name, "bad_tool");
+                assert!(message.contains("parallel panic test"));
+            }
+            other => panic!("Expected ToolPanic, got: {:?}", other),
+        }
+    }
 }

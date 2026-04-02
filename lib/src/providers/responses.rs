@@ -225,6 +225,7 @@ impl Provider for ResponsesProvider {
         let mut pending_tool_calls: HashMap<u32, PendingToolCall> = HashMap::new();
         let mut full_content = String::new();
         let mut usage: Option<Usage> = None;
+        let mut got_completed = false;
 
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
@@ -300,6 +301,7 @@ impl Provider for ResponsesProvider {
                         }
                     }
                     "response.completed" => {
+                        got_completed = true;
                         // Extract usage if present
                         if let Some(resp_usage) = parsed.get("response").and_then(|r| r.get("usage")) {
                             let input_tokens = resp_usage["input_tokens"].as_u64().unwrap_or(0) as u32;
@@ -316,6 +318,12 @@ impl Provider for ResponsesProvider {
                     }
                 }
             }
+        }
+
+        if !got_completed {
+            return Err(AgentError::Stream(
+                "Stream ended without response.completed".into(),
+            ));
         }
 
         // Build final response
@@ -490,5 +498,58 @@ mod tests {
         assert_eq!(input[0]["role"], "assistant");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["call_id"], "c1");
+    }
+
+    #[test]
+    fn test_multimodal_parts_conversion() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
+
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "What's in this image?".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/photo.png".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        let input = provider.messages_to_input(&[msg]);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "What's in this image?");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "https://example.com/photo.png");
+    }
+
+    #[test]
+    fn test_empty_messages_conversion() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
+        let input = provider.messages_to_input(&[]);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn test_user_none_content_skipped() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let input = provider.messages_to_input(&[msg]);
+        assert!(input.is_empty()); // None content user messages are skipped
     }
 }

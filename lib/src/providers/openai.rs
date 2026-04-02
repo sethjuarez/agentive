@@ -54,7 +54,7 @@ impl OpenAiProvider {
     }
 
     fn chat_url(&self) -> String {
-        if self.endpoint.ends_with("/chat/completions") {
+        if self.endpoint.contains("/chat/completions") {
             self.endpoint.clone()
         } else {
             format!("{}/chat/completions", self.endpoint)
@@ -314,6 +314,20 @@ mod tests {
             .with_vision(true);
         assert_eq!(p.context_budget_chars(), 100_000);
         assert!(p.supports_vision());
+    }
+
+    #[test]
+    fn test_chat_url_with_query_params() {
+        // Azure URLs with api-version query params should not get /chat/completions appended
+        let p = OpenAiProvider::new(
+            "https://my.azure.com/openai/deployments/gpt4/chat/completions?api-version=2024-10-21",
+            "key",
+            "gpt-4o",
+        );
+        assert_eq!(
+            p.chat_url(),
+            "https://my.azure.com/openai/deployments/gpt4/chat/completions?api-version=2024-10-21"
+        );
     }
 
     #[tokio::test]

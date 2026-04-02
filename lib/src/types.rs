@@ -33,11 +33,11 @@ impl MessageContent {
     /// Estimate character length for context budget calculations.
     pub fn char_len(&self) -> usize {
         match self {
-            MessageContent::Text(s) => s.len(),
+            MessageContent::Text(s) => s.chars().count(),
             MessageContent::Parts(parts) => parts
                 .iter()
                 .map(|p| match p {
-                    ContentPart::Text { text } => text.len(),
+                    ContentPart::Text { text } => text.chars().count(),
                     ContentPart::ImageUrl { .. } => 200, // rough estimate for image reference
                 })
                 .sum(),

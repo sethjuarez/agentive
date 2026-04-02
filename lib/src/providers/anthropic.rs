@@ -486,4 +486,87 @@ mod tests {
         assert_eq!(content[0]["type"], "tool_use");
         assert_eq!(content[0]["name"], "read_file");
     }
+
+    #[test]
+    fn test_prepare_request_multimodal_user() {
+        let provider = AnthropicProvider::new("key", "claude-sonnet-4-20250514");
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "Describe this".into(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "https://example.com/img.png".into(),
+                            detail: None,
+                        },
+                    },
+                ])),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            model: "claude-sonnet-4-20250514".into(),
+            tools: None,
+            stream: true,
+            response_format: None,
+        };
+
+        let (_, messages, _) = provider.prepare_request(&request);
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Describe this");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "url");
+        assert_eq!(content[1]["source"]["url"], "https://example.com/img.png");
+    }
+
+    #[test]
+    fn test_prepare_request_multiple_systems_last_wins() {
+        let provider = AnthropicProvider::new("key", "claude-sonnet-4-20250514");
+
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage::system("First system"),
+                ChatMessage::system("Second system"),
+                ChatMessage::user("Hello"),
+            ],
+            model: "claude-sonnet-4-20250514".into(),
+            tools: None,
+            stream: true,
+            response_format: None,
+        };
+
+        let (system, messages, _) = provider.prepare_request(&request);
+        assert_eq!(system.as_deref(), Some("Second system"));
+        assert_eq!(messages.len(), 1); // only user
+    }
+
+    #[test]
+    fn test_prepare_request_tool_definitions() {
+        let provider = AnthropicProvider::new("key", "claude-sonnet-4-20250514");
+
+        let request = ChatRequest {
+            messages: vec![ChatMessage::user("Hello")],
+            model: "claude-sonnet-4-20250514".into(),
+            tools: Some(vec![Tool::function(
+                "read_file",
+                "Reads a file",
+                serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            )]),
+            stream: true,
+            response_format: None,
+        };
+
+        let (_, _, tools) = provider.prepare_request(&request);
+        let tools = tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "read_file");
+        assert_eq!(tools[0]["description"], "Reads a file");
+        assert!(tools[0]["input_schema"].is_object());
+    }
 }
