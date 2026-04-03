@@ -53,6 +53,22 @@ pub struct AiResource {
     pub location: String,
     /// Resource group name.
     pub resource_group: String,
+    /// For AI Services resources, the Foundry base URL
+    /// (`https://{name}.services.ai.azure.com`). `None` for pure OpenAI resources.
+    #[serde(default)]
+    pub foundry_url: Option<String>,
+}
+
+/// A Foundry project within an AI Services hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoundryProject {
+    /// Project workspace name (used in the endpoint path).
+    pub name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// The full project inference endpoint
+    /// (`https://{hub}.services.ai.azure.com/api/projects/{name}`).
+    pub endpoint: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +109,22 @@ struct ArmCogProperties {
     endpoint: Option<String>,
     #[serde(default)]
     endpoints: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmMlWorkspace {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    properties: Option<ArmMlWorkspaceProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArmMlWorkspaceProperties {
+    #[serde(default)]
+    friendly_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,12 +191,52 @@ pub async fn list_ai_resources(
                 .and_then(extract_resource_group)
                 .unwrap_or_default();
             Some(AiResource {
+                foundry_url: if kind == "AIServices" {
+                    Some(format!("https://{}.services.ai.azure.com", a.name))
+                } else {
+                    None
+                },
                 name: a.name,
                 kind,
                 endpoint,
                 location: a.location.unwrap_or_default(),
                 resource_group: rg,
             })
+        })
+        .collect())
+}
+
+/// List Foundry projects within a resource group.
+///
+/// Queries `Microsoft.MachineLearningServices/workspaces` and filters to
+/// `kind == "Project"`. Returns project endpoints constructed from the
+/// AI Services resource name.
+pub async fn list_foundry_projects(
+    token: &str,
+    subscription_id: &str,
+    resource_group: &str,
+    resource_name: &str,
+) -> Result<Vec<FoundryProject>, String> {
+    let url = format!(
+        "{ARM_BASE}/subscriptions/{subscription_id}/resourceGroups/{resource_group}/\
+         providers/Microsoft.MachineLearningServices/workspaces?api-version=2024-10-01"
+    );
+    let items = fetch_all_pages::<ArmMlWorkspace>(token, &url).await?;
+    let base = format!("https://{resource_name}.services.ai.azure.com");
+    Ok(items
+        .into_iter()
+        .filter(|w| w.kind.as_deref() == Some("Project"))
+        .map(|w| {
+            let display = w
+                .properties
+                .as_ref()
+                .and_then(|p| p.friendly_name.clone())
+                .unwrap_or_else(|| w.name.clone());
+            FoundryProject {
+                endpoint: format!("{base}/api/projects/{}", w.name),
+                display_name: display,
+                name: w.name,
+            }
         })
         .collect())
 }
@@ -311,12 +383,18 @@ mod tests {
                 let endpoint = a.properties.as_ref().and_then(|p| p.endpoint.clone()).unwrap_or_default();
                 if endpoint.is_empty() { return None; }
                 let rg = a.id.as_deref().and_then(extract_resource_group).unwrap_or_default();
+                let foundry_url = if kind == "AIServices" {
+                    Some(format!("https://{}.services.ai.azure.com", a.name))
+                } else {
+                    None
+                };
                 Some(AiResource {
                     name: a.name,
                     kind,
                     endpoint,
                     location: a.location.unwrap_or_default(),
                     resource_group: rg,
+                    foundry_url,
                 })
             })
             .collect();
@@ -329,8 +407,13 @@ mod tests {
             "https://my-ai-services.cognitiveservices.azure.com/"
         );
         assert_eq!(resources[0].resource_group, "my-rg");
+        assert_eq!(
+            resources[0].foundry_url.as_deref(),
+            Some("https://my-ai-services.services.ai.azure.com")
+        );
         assert_eq!(resources[1].name, "my-openai");
         assert_eq!(resources[1].kind, "OpenAI");
+        assert_eq!(resources[1].foundry_url, None);
     }
 
     #[test]
@@ -380,5 +463,47 @@ mod tests {
             parsed.next_link.as_deref(),
             Some("https://management.azure.com/next?page=2")
         );
+    }
+
+    #[test]
+    fn test_parse_ml_workspaces_projects() {
+        let body = r#"{"value":[
+            {"name":"dev-models","kind":"Project","properties":{"friendlyName":"Dev Models"}},
+            {"name":"my-hub","kind":"Hub","properties":{"friendlyName":"My Hub"}},
+            {"name":"prod-models","kind":"Project","properties":{}}
+        ]}"#;
+        let parsed: ArmListResponse<ArmMlWorkspace> = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.value.len(), 3);
+
+        // Filter like list_foundry_projects does
+        let base = "https://seth-foundry-dev.services.ai.azure.com";
+        let projects: Vec<_> = parsed
+            .value
+            .into_iter()
+            .filter(|w| w.kind.as_deref() == Some("Project"))
+            .map(|w| {
+                let display = w
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.friendly_name.clone())
+                    .unwrap_or_else(|| w.name.clone());
+                FoundryProject {
+                    endpoint: format!("{base}/api/projects/{}", w.name),
+                    display_name: display,
+                    name: w.name,
+                }
+            })
+            .collect();
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name, "dev-models");
+        assert_eq!(projects[0].display_name, "Dev Models");
+        assert_eq!(
+            projects[0].endpoint,
+            "https://seth-foundry-dev.services.ai.azure.com/api/projects/dev-models"
+        );
+        // When no friendly_name, falls back to workspace name
+        assert_eq!(projects[1].name, "prod-models");
+        assert_eq!(projects[1].display_name, "prod-models");
     }
 }
