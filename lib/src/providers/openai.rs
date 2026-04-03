@@ -92,10 +92,11 @@ impl OpenAiProvider {
 
     fn chat_url(&self) -> String {
         if self.endpoint.contains("/chat/completions") {
+            // Already a fully-qualified URL — use as-is
             self.endpoint.clone()
         } else if self.endpoint.contains("/api/projects/") {
             // Foundry project: strip /api/projects/... to get the resource base,
-            // then use deployment-based URL (matches CutReady's proven pattern)
+            // then use deployment-based URL
             let base = match self.endpoint.find("/api/projects") {
                 Some(idx) => &self.endpoint[..idx],
                 None => &self.endpoint,
@@ -103,6 +104,13 @@ impl OpenAiProvider {
             format!(
                 "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
                 base, self.model
+            )
+        } else if self.endpoint.contains("azure.com") {
+            // Plain Azure OpenAI endpoint (e.g. https://my-resource.openai.azure.com)
+            // Uses deployment-based URL where model name = deployment name
+            format!(
+                "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
+                self.endpoint, self.model
             )
         } else {
             format!("{}/chat/completions", self.endpoint)
@@ -382,6 +390,34 @@ mod tests {
             .with_vision(true);
         assert_eq!(p.context_budget_chars(), 100_000);
         assert!(p.supports_vision());
+    }
+
+    #[test]
+    fn test_chat_url_plain_azure() {
+        // Plain Azure OpenAI endpoint (not Foundry) uses deployment-based URL
+        let p = OpenAiProvider::new(
+            "https://my-resource.openai.azure.com",
+            "key",
+            "gpt-4o",
+        );
+        assert_eq!(
+            p.chat_url(),
+            "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn test_chat_url_azure_services() {
+        // Azure AI Services endpoint (not Foundry project, no /api/projects/)
+        let p = OpenAiProvider::new(
+            "https://my-resource.services.ai.azure.com",
+            "key",
+            "gpt-4o",
+        );
+        assert_eq!(
+            p.chat_url(),
+            "https://my-resource.services.ai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
+        );
     }
 
     #[test]
