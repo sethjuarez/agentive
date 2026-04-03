@@ -130,7 +130,7 @@ fn is_foundry(endpoint: &str) -> bool {
 
 /// Returns true if the endpoint looks like Azure OpenAI (not Foundry).
 fn is_azure_openai(endpoint: &str) -> bool {
-    endpoint.contains(".openai.azure.com")
+    endpoint.contains(".openai.azure.com") || endpoint.contains(".cognitiveservices.azure.com")
 }
 
 /// Strip any `/api/projects/...` suffix from a Foundry endpoint.
@@ -335,6 +335,7 @@ mod tests {
     #[test]
     fn test_is_azure_openai() {
         assert!(is_azure_openai("https://my-resource.openai.azure.com"));
+        assert!(is_azure_openai("https://my-resource.cognitiveservices.azure.com"));
         assert!(!is_azure_openai("https://my-project.services.ai.azure.com"));
         assert!(!is_azure_openai("https://api.openai.com"));
     }

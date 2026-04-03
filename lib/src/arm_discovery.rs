@@ -140,11 +140,13 @@ pub async fn list_ai_resources(
                 .properties
                 .as_ref()
                 .and_then(|p| {
-                    p.endpoint.clone().or_else(|| {
-                        p.endpoints
-                            .as_ref()
-                            .and_then(|e| e.get("OpenAI Language Model Instance API").cloned())
-                    })
+                    // Prefer the OpenAI-specific endpoint (*.openai.azure.com)
+                    // over the generic cognitiveservices endpoint which doesn't
+                    // serve the /openai/deployments API.
+                    p.endpoints
+                        .as_ref()
+                        .and_then(|e| e.get("OpenAI Language Model Instance API").cloned())
+                        .or_else(|| p.endpoint.clone())
                 })
                 .unwrap_or_default();
             if endpoint.is_empty() {
@@ -333,12 +335,14 @@ mod tests {
 
     #[test]
     fn test_parse_cog_accounts_with_endpoints_map() {
+        // When both endpoint and endpoints map exist, prefer the OpenAI-specific one
         let body = r#"{"value":[{
             "name":"foundry-svc",
             "kind":"AIServices",
             "location":"eastus2",
             "id":"/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.CognitiveServices/accounts/foundry-svc",
             "properties":{
+                "endpoint":"https://foundry-svc.cognitiveservices.azure.com/",
                 "endpoints":{
                     "OpenAI Language Model Instance API":"https://foundry-svc.openai.azure.com/"
                 }
@@ -350,11 +354,10 @@ mod tests {
             .properties
             .as_ref()
             .and_then(|p| {
-                p.endpoint.clone().or_else(|| {
-                    p.endpoints
-                        .as_ref()
-                        .and_then(|e| e.get("OpenAI Language Model Instance API").cloned())
-                })
+                p.endpoints
+                    .as_ref()
+                    .and_then(|e| e.get("OpenAI Language Model Instance API").cloned())
+                    .or_else(|| p.endpoint.clone())
             })
             .unwrap_or_default();
         assert_eq!(endpoint, "https://foundry-svc.openai.azure.com/");
