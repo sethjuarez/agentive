@@ -34,6 +34,7 @@ pub mod auth;
 pub mod azure_oauth;
 pub mod cancel;
 pub mod context;
+pub mod discovery;
 pub mod error;
 pub mod guardrails;
 pub mod parse;
