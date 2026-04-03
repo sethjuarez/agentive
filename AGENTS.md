@@ -324,7 +324,7 @@ use std::sync::Arc;
 
 let config = RunnerConfig {
     tool_filter: Some(Arc::new(|messages: &[ChatMessage]| {
-        let has_plan = messages.iter().any(|m| m.text().map_or(false, |t| t.contains("PLAN:")));
+        let has_plan = messages.iter().any(|m| m.text().is_some_and(|t| t.contains("PLAN:")));
         if has_plan {
             // After planning, enable write tools
             vec![
@@ -341,6 +341,62 @@ let config = RunnerConfig {
 ```
 
 When `tool_filter` is `None` (the default), the static `tools` vec passed to `run()` is used every round.
+
+## @reference resolver
+
+Resolve `@name` references in user messages to inject contextual content before LLM calls:
+
+```rust
+use agentive::{RunnerConfig, ReferenceResolver, ResolvedReference};
+use std::sync::Arc;
+
+let resolver: ReferenceResolver = Arc::new(|name| {
+    Box::pin(async move {
+        // App-specific resolution: files, DB records, API responses, etc.
+        match name.as_str() {
+            "intro.sk" => Some(ResolvedReference {
+                name: "intro.sk".into(),
+                content: "# Intro\nWelcome to the demo.".into(),
+                content_type: "text/markdown".into(),
+            }),
+            _ => None, // Unknown references are silently ignored
+        }
+    })
+});
+
+let config = RunnerConfig {
+    reference_resolver: Some(resolver),
+    ..Default::default()
+};
+```
+
+### How it works
+
+1. Before the first LLM call, the runner scans all user messages for `@name` or `@"quoted name"` patterns
+2. For each unique reference found, calls the resolver asynchronously (all references resolved concurrently)
+3. Resolved content is appended to the user message as XML-tagged context blocks
+4. After steering injects new messages mid-run, those are also scanned and resolved
+5. Messages that already contain `<referenced_document` are skipped (no re-resolution)
+
+### Reference syntax
+
+- `@word` — alphanumeric, hyphens, underscores, dots, slashes (e.g., `@intro.sk`, `@docs/setup`)
+- `@"quoted name"` — arbitrary text in double quotes (e.g., `@"my sketch with spaces"`)
+
+### Injected format
+
+```xml
+<referenced_document name="intro.sk" content_type="text/markdown">
+# Intro
+Welcome to the demo.
+</referenced_document>
+```
+
+### Use cases
+
+- **CutReady**: `@sketch.sk` resolves to sketch JSON, `@notes.md` to markdown content
+- **sethjuarez.com**: `@blog-post` resolves to content by slug
+- **Any app**: files, database records, API responses, embeddings — the resolver is fully app-defined
 
 ## Guardrails (guardrails.rs)
 

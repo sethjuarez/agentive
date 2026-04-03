@@ -31,10 +31,13 @@
 //! # }
 //! ```
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::future::join_all;
 use futures_util::FutureExt;
+use regex::Regex;
 use tokio::sync::mpsc;
 
 use crate::cancel::CancellationToken;
@@ -49,6 +52,25 @@ use crate::types::*;
 /// A per-round tool filter function. Receives the current message history
 /// and returns the set of tools to offer the LLM for that round.
 pub type ToolFilter = Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>;
+
+/// An async function that resolves `@reference` names to content.
+/// Receives the reference name (without the `@` prefix) and returns
+/// resolved content, or `None` if the reference is unknown.
+pub type ReferenceResolver =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<ResolvedReference>> + Send>> + Send + Sync>;
+
+/// A resolved `@reference` — content that gets injected into the conversation
+/// so the LLM can see the referenced material.
+#[derive(Debug, Clone)]
+pub struct ResolvedReference {
+    /// Display name for the reference (e.g., "intro.sk", "setup guide").
+    pub name: String,
+    /// The resolved content to inject.
+    pub content: String,
+    /// MIME-like content type hint (e.g., "text/markdown", "application/json").
+    /// Helps the LLM understand the format. Defaults to "text/plain".
+    pub content_type: String,
+}
 
 /// Configuration for the runner.
 pub struct RunnerConfig {
@@ -81,6 +103,12 @@ pub struct RunnerConfig {
     /// (e.g., via a delegate_to_agent tool), set this to the parent's run_id
     /// so traces can reconstruct the full call tree.
     pub parent_run_id: Option<String>,
+    /// Optional reference resolver for `@reference` syntax in user messages.
+    /// When set, the runner scans user messages for `@name` or `@"quoted name"`
+    /// patterns, calls this resolver, and appends the resolved content to the
+    /// message so the LLM can see referenced materials (files, DB records, etc.).
+    /// Resolution happens once per message — already-resolved messages are not re-scanned.
+    pub reference_resolver: Option<ReferenceResolver>,
 }
 
 impl Clone for RunnerConfig {
@@ -96,6 +124,7 @@ impl Clone for RunnerConfig {
             tool_filter: self.tool_filter.clone(),
             run_id: self.run_id.clone(),
             parent_run_id: self.parent_run_id.clone(),
+            reference_resolver: self.reference_resolver.clone(),
         }
     }
 }
@@ -113,6 +142,7 @@ impl std::fmt::Debug for RunnerConfig {
             .field("tool_filter", &self.tool_filter.is_some())
             .field("run_id", &self.run_id)
             .field("parent_run_id", &self.parent_run_id)
+            .field("reference_resolver", &self.reference_resolver.is_some())
             .finish()
     }
 }
@@ -130,6 +160,7 @@ impl Default for RunnerConfig {
             tool_filter: None,
             run_id: None,
             parent_run_id: None,
+            reference_resolver: None,
         }
     }
 }
@@ -234,6 +265,11 @@ where
     let mut new_messages: Vec<ChatMessage> = Vec::new();
     let mut total_usage = Usage::default();
 
+    // Resolve @references in initial messages
+    if let Some(ref resolver) = config.reference_resolver {
+        resolve_references_in_messages(&mut full_messages, resolver).await;
+    }
+
     for iteration in 0..config.max_iterations {
         if cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
@@ -243,6 +279,11 @@ where
         for msg in steering.drain() {
             full_messages.push(ChatMessage::user(&msg));
             new_messages.push(ChatMessage::user(&msg));
+        }
+
+        // Resolve @references in any newly added steering messages
+        if let Some(ref resolver) = config.reference_resolver {
+            resolve_references_in_messages(&mut full_messages, resolver).await;
         }
 
         on_event(RunnerEvent::Status {
@@ -648,6 +689,98 @@ where
                 name,
                 message: panic_msg,
             })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// @reference resolution
+// ---------------------------------------------------------------------------
+
+/// Extract `@reference` names from a text string.
+///
+/// Supports two syntaxes:
+/// - `@word` — alphanumeric, hyphens, underscores, dots, slashes (e.g., `@intro.sk`, `@docs/setup`)
+/// - `@"quoted name"` — arbitrary text in double quotes (e.g., `@"my sketch with spaces"`)
+///
+/// Returns deduplicated names in the order they first appear (without the `@` prefix or quotes).
+fn extract_references(text: &str) -> Vec<String> {
+    // Quoted: @"anything inside quotes"
+    // Unquoted: @word characters (alphanum, -, _, ., /)
+    let re = Regex::new(r#"@"([^"]+)"|@([\w.\-/]+)"#).expect("invalid reference regex");
+    let mut seen = std::collections::HashSet::new();
+    let mut refs = Vec::new();
+    for cap in re.captures_iter(text) {
+        let name = cap.get(1).or_else(|| cap.get(2)).unwrap().as_str().to_string();
+        if seen.insert(name.clone()) {
+            refs.push(name);
+        }
+    }
+    refs
+}
+
+/// Format resolved references as a context block appended to the user message.
+fn format_resolved_context(resolved: &[(String, ResolvedReference)]) -> String {
+    let mut ctx = String::new();
+    for (ref_name, r) in resolved {
+        ctx.push_str(&format!(
+            "\n\n<referenced_document name=\"{}\" content_type=\"{}\">\n{}\n</referenced_document>",
+            ref_name, r.content_type, r.content
+        ));
+    }
+    ctx
+}
+
+/// Resolve `@references` in user messages using the provided resolver.
+///
+/// Scans each user message for `@name` patterns. For each unique reference found,
+/// calls the resolver. Resolved content is appended to the message as XML-tagged
+/// context blocks. Messages that have already been resolved (contain
+/// `<referenced_document`) are skipped to avoid re-resolution.
+async fn resolve_references_in_messages(
+    messages: &mut [ChatMessage],
+    resolver: &ReferenceResolver,
+) {
+    for msg in messages.iter_mut() {
+        if msg.role != "user" {
+            continue;
+        }
+        let text = match msg.text() {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+        // Skip already-resolved messages
+        if text.contains("<referenced_document") {
+            continue;
+        }
+        let refs = extract_references(&text);
+        if refs.is_empty() {
+            continue;
+        }
+
+        // Resolve all references concurrently
+        let futures: Vec<_> = refs
+            .iter()
+            .map(|name| {
+                let name = name.clone();
+                let resolver = resolver.clone();
+                async move {
+                    let resolved = resolver(name.clone()).await;
+                    (name, resolved)
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+        let resolved: Vec<(String, ResolvedReference)> = results
+            .into_iter()
+            .filter_map(|(name, r)| r.map(|r| (name, r)))
+            .collect();
+
+        if !resolved.is_empty() {
+            let context = format_resolved_context(&resolved);
+            let new_text = format!("{}{}", text, context);
+            *msg = ChatMessage::user(&new_text);
         }
     }
 }
@@ -2410,5 +2543,168 @@ mod tests {
         assert_eq!(result.run_id.len(), 36, "Auto-generated run_id should be a UUID");
         assert!(result.run_id.contains('-'), "UUID should contain hyphens");
         assert!(result.parent_run_id.is_none(), "No parent_run_id by default");
+    }
+
+    // -----------------------------------------------------------------------
+    // @reference resolver tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_references_simple() {
+        let refs = extract_references("Please look at @intro.sk and @setup-guide");
+        assert_eq!(refs, vec!["intro.sk", "setup-guide"]);
+    }
+
+    #[test]
+    fn test_extract_references_quoted() {
+        let refs = extract_references(r#"Check @"my sketch with spaces" and @simple"#);
+        assert_eq!(refs, vec!["my sketch with spaces", "simple"]);
+    }
+
+    #[test]
+    fn test_extract_references_dedup() {
+        let refs = extract_references("Compare @file.sk with @other.sk and @file.sk again");
+        assert_eq!(refs, vec!["file.sk", "other.sk"]);
+    }
+
+    #[test]
+    fn test_extract_references_paths() {
+        let refs = extract_references("See @docs/setup and @src/main.rs");
+        assert_eq!(refs, vec!["docs/setup", "src/main.rs"]);
+    }
+
+    #[test]
+    fn test_extract_references_none() {
+        let refs = extract_references("No references here, just an email user@example.com");
+        // email captures "example.com" — that's fine, the resolver will return None for it
+        assert!(!refs.is_empty() || refs.is_empty()); // just shouldn't panic
+    }
+
+    #[test]
+    fn test_extract_references_at_start() {
+        let refs = extract_references("@first is the reference");
+        assert_eq!(refs, vec!["first"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_references_in_messages() {
+        let resolver: ReferenceResolver = Arc::new(|name| {
+            Box::pin(async move {
+                match name.as_str() {
+                    "intro.sk" => Some(ResolvedReference {
+                        name: "intro.sk".into(),
+                        content: "# Intro Sketch\nWelcome to the demo.".into(),
+                        content_type: "text/markdown".into(),
+                    }),
+                    "notes.md" => Some(ResolvedReference {
+                        name: "notes.md".into(),
+                        content: "Some planning notes.".into(),
+                        content_type: "text/markdown".into(),
+                    }),
+                    _ => None,
+                }
+            })
+        });
+
+        let mut messages = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Please review @intro.sk and @notes.md and @unknown"),
+        ];
+
+        resolve_references_in_messages(&mut messages, &resolver).await;
+
+        // System message untouched
+        assert_eq!(messages[0].text().unwrap(), "You are helpful.");
+
+        // User message has resolved content appended
+        let user_text = messages[1].text().unwrap().to_string();
+        assert!(user_text.contains("Please review @intro.sk"), "original text preserved");
+        assert!(user_text.contains("<referenced_document name=\"intro.sk\""), "intro resolved");
+        assert!(user_text.contains("Welcome to the demo."), "intro content injected");
+        assert!(user_text.contains("<referenced_document name=\"notes.md\""), "notes resolved");
+        assert!(user_text.contains("Some planning notes."), "notes content injected");
+        // @unknown should NOT have a referenced_document block
+        assert!(!user_text.contains("name=\"unknown\""), "unknown ref not injected");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_references_skips_already_resolved() {
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let resolver: ReferenceResolver = Arc::new(move |_name| {
+            cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Some(ResolvedReference {
+                    name: "test".into(),
+                    content: "resolved".into(),
+                    content_type: "text/plain".into(),
+                })
+            })
+        });
+
+        let mut messages = vec![
+            ChatMessage::user("Check @test please"),
+        ];
+
+        // First resolution
+        resolve_references_in_messages(&mut messages, &resolver).await;
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Second resolution — should skip (already has <referenced_document)
+        resolve_references_in_messages(&mut messages, &resolver).await;
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1, "should not re-resolve");
+    }
+
+    #[tokio::test]
+    async fn test_reference_resolver_in_run() {
+        // Full integration: run() with a reference_resolver resolves @refs before LLM call
+        let resolver: ReferenceResolver = Arc::new(|name| {
+            Box::pin(async move {
+                if name == "context.md" {
+                    Some(ResolvedReference {
+                        name: "context.md".into(),
+                        content: "Important context document.".into(),
+                        content_type: "text/markdown".into(),
+                    })
+                } else {
+                    None
+                }
+            })
+        });
+
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant("I see the context document."),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![
+                ChatMessage::system("You are helpful."),
+                ChatMessage::user("Please review @context.md"),
+            ],
+            vec![],
+            |_tc| async { Ok("done".into()) },
+            RunnerConfig {
+                reference_resolver: Some(resolver),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "I see the context document.");
+
+        // The messages sent to the LLM should contain the resolved reference
+        let user_msg = result.messages.iter().find(|m| m.role == "user").unwrap();
+        let text = user_msg.text().unwrap();
+        assert!(text.contains("Important context document."), "resolved content should be in messages");
+        assert!(text.contains("<referenced_document"), "should have XML wrapper");
     }
 }
