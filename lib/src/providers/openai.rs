@@ -93,6 +93,12 @@ impl OpenAiProvider {
     fn chat_url(&self) -> String {
         if self.endpoint.contains("/chat/completions") {
             self.endpoint.clone()
+        } else if self.endpoint.contains("/api/projects/") {
+            // Foundry project endpoints need the /openai prefix + api-version
+            format!(
+                "{}/openai/chat/completions?api-version=2024-10-21",
+                self.endpoint
+            )
         } else {
             format!("{}/chat/completions", self.endpoint)
         }
@@ -312,6 +318,19 @@ impl PendingToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chat_url_foundry_project() {
+        let p = OpenAiProvider::new(
+            "https://my-resource.services.ai.azure.com/api/projects/my-project",
+            "key",
+            "gpt-4o",
+        );
+        assert_eq!(
+            p.chat_url(),
+            "https://my-resource.services.ai.azure.com/api/projects/my-project/openai/chat/completions?api-version=2024-10-21"
+        );
+    }
 
     #[test]
     fn test_chat_url_no_suffix() {
