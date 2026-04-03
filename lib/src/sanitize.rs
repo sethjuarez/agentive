@@ -49,6 +49,32 @@ fn strip_inline_base64(s: &str) -> String {
     result
 }
 
+/// Sanitize all text in a [`ChatMessage`] — content, content parts, and
+/// tool call arguments. Call this before sending messages to an LLM API
+/// to prevent JSON parse errors from control characters in user input,
+/// tool results, or model-generated content.
+pub fn sanitize_message(msg: &mut crate::types::ChatMessage) {
+    use crate::types::{ContentPart, MessageContent};
+
+    if let Some(content) = &mut msg.content {
+        match content {
+            MessageContent::Text(t) => *t = sanitize_for_api(t),
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    if let ContentPart::Text { text } = p {
+                        *text = sanitize_for_api(text);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tool_calls) = &mut msg.tool_calls {
+        for tc in tool_calls {
+            tc.function.arguments = sanitize_for_api(&tc.function.arguments);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +105,43 @@ mod tests {
     fn test_no_base64_passthrough() {
         let input = "normal text with no images";
         assert_eq!(sanitize_for_api(input), input);
+    }
+
+    #[test]
+    fn test_sanitize_message_cleans_all_fields() {
+        use crate::types::{ChatMessage, ContentPart, FunctionCall, MessageContent, ToolCall};
+
+        let mut msg = ChatMessage {
+            role: "assistant".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "hello\x00world".into() },
+            ])),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "test".into(),
+                    arguments: "{\x01\"key\": \"val\"}".into(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+
+        sanitize_message(&mut msg);
+
+        match msg.content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => {
+                if let ContentPart::Text { text } = &parts[0] {
+                    assert_eq!(text, "helloworld");
+                } else {
+                    panic!("Expected text part");
+                }
+            }
+            _ => panic!("Expected parts"),
+        }
+        assert_eq!(
+            msg.tool_calls.as_ref().unwrap()[0].function.arguments,
+            "{\"key\": \"val\"}"
+        );
     }
 }

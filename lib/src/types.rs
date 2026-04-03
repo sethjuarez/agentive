@@ -71,7 +71,8 @@ pub struct ImageUrl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Content is serialized as `null` (not omitted) when None. The OpenAI API
+    /// requires `"content": null` on assistant messages that have tool_calls.
     pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
