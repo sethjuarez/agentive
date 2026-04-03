@@ -62,19 +62,17 @@ pub fn default_context_budget(model: &str) -> usize {
     let token_limit: usize = if m.contains("codex") {
         // Responses API models have limited effective context due to body size limits
         16_000
-    } else if m.contains("gpt-5") {
-        128_000
-    } else if m.contains("gpt-4o") {
-        128_000
-    } else if m.contains("gpt-4.1") {
-        128_000
-    } else if m.contains("gpt-4-turbo") {
-        128_000
-    } else if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
-        128_000
     } else if m.contains("claude-3-5") || m.contains("claude-3.5") || m.contains("claude-4") {
         200_000
-    } else if m.contains("gemini") {
+    } else if m.contains("gpt-5")
+        || m.contains("gpt-4o")
+        || m.contains("gpt-4.1")
+        || m.contains("gpt-4-turbo")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.contains("gemini")
+    {
         128_000
     } else if m.contains("gpt-4") {
         8_192

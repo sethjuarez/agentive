@@ -46,6 +46,10 @@ use crate::sanitize::sanitize_for_api;
 use crate::steering::Steering;
 use crate::types::*;
 
+/// A per-round tool filter function. Receives the current message history
+/// and returns the set of tools to offer the LLM for that round.
+pub type ToolFilter = Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>;
+
 /// Configuration for the runner.
 pub struct RunnerConfig {
     /// Maximum number of tool-call rounds before giving up.
@@ -69,7 +73,7 @@ pub struct RunnerConfig {
     /// Use this for progressive disclosure, agent-specific tool sets, or
     /// conditional tool availability.
     /// When `None`, the static `tools` vec passed to `run()` is used every round.
-    pub tool_filter: Option<Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>>,
+    pub tool_filter: Option<ToolFilter>,
     /// Unique identifier for this run. Auto-generated UUID v4 if not set.
     /// Use this to correlate events across logs, traces, and UI.
     pub run_id: Option<String>,
@@ -205,6 +209,7 @@ pub struct RunnerResult {
 /// * `steering` - Handle for injecting user messages mid-run (see [`Steering`]).
 /// * `guardrails` - Optional validation hooks (see [`Guardrails`]).
 /// * `on_event` - Callback for runner events (streaming tokens, status, etc.).
+#[allow(clippy::too_many_arguments)]
 pub async fn run<F, Fut, E>(
     provider: Arc<dyn Provider>,
     messages: Vec<ChatMessage>,
@@ -277,7 +282,7 @@ where
                             .unwrap_or(0);
                         if system_end < full_messages.len()
                             && full_messages[system_end].role == "user"
-                            && full_messages[system_end].text().map_or(false, |t| t.starts_with("[Earlier conversation summary"))
+                            && full_messages[system_end].text().is_some_and(|t| t.starts_with("[Earlier conversation summary"))
                         {
                             full_messages[system_end] = ChatMessage::user(&llm_summary);
                         }
@@ -2096,7 +2101,7 @@ mod tests {
         // Verify the LLM summary was inserted into the message history
         let summary_msg = result.messages.iter().find(|m| {
             m.role == "user"
-                && m.text().map_or(false, |t| t.contains("ownership and borrowing"))
+                && m.text().is_some_and(|t| t.contains("ownership and borrowing"))
         });
         assert!(
             summary_msg.is_some(),
@@ -2168,7 +2173,7 @@ mod tests {
         // The string-based summary should still be present (fallback)
         let has_summary = result.messages.iter().any(|m| {
             m.role == "user"
-                && m.text().map_or(false, |t| t.starts_with("[Earlier conversation summary]"))
+                && m.text().is_some_and(|t| t.starts_with("[Earlier conversation summary]"))
         });
         assert!(
             has_summary,
@@ -2277,7 +2282,7 @@ mod tests {
                 tool_filter: Some(Arc::new(move |msgs| {
                     fcc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let has_read_result = msgs.iter().any(|m| {
-                        m.role == "tool" && m.text().map_or(false, |t| t.contains("result from read_file"))
+                        m.role == "tool" && m.text().is_some_and(|t| t.contains("result from read_file"))
                     });
                     let mut tools = vec![Tool::function("read_file", "reads", serde_json::json!({}))];
                     if has_read_result {

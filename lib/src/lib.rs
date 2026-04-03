@@ -57,6 +57,6 @@ pub use provider::Provider;
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::openai::OpenAiProvider;
 pub use providers::responses::ResponsesProvider;
-pub use runner::{run, RunnerConfig, RunnerEvent, RunnerResult};
+pub use runner::{run, RunnerConfig, RunnerEvent, RunnerResult, ToolFilter};
 pub use steering::Steering;
 pub use types::*;
