@@ -94,10 +94,15 @@ impl OpenAiProvider {
         if self.endpoint.contains("/chat/completions") {
             self.endpoint.clone()
         } else if self.endpoint.contains("/api/projects/") {
-            // Foundry project: use deployment-based URL with GA api-version
+            // Foundry project: strip /api/projects/... to get the resource base,
+            // then use deployment-based URL (matches CutReady's proven pattern)
+            let base = match self.endpoint.find("/api/projects") {
+                Some(idx) => &self.endpoint[..idx],
+                None => &self.endpoint,
+            };
             format!(
                 "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
-                self.endpoint, self.model
+                base, self.model
             )
         } else {
             format!("{}/chat/completions", self.endpoint)
@@ -326,9 +331,10 @@ mod tests {
             "key",
             "gpt-4o",
         );
+        // Strips /api/projects/... and uses deployment-based URL
         assert_eq!(
             p.chat_url(),
-            "https://my-resource.services.ai.azure.com/api/projects/my-project/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
+            "https://my-resource.services.ai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
         );
     }
 
