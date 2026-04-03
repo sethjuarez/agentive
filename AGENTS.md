@@ -413,6 +413,97 @@ agentive = { git = "https://github.com/sethjuarez/agentive", path = "lib" }
 # agentive = { path = "../../agentive/lib" }
 ```
 
+## Azure Discovery & Endpoint Patterns
+
+### Model discovery (discovery.rs)
+
+`list_models()` auto-detects the endpoint type and routes accordingly:
+
+| Endpoint pattern | Detection | Listing URL |
+|---|---|---|
+| `*.services.ai.azure.com/api/projects/*` | Foundry project | `{project}/deployments?api-version=v1` (then fallback to catalog) |
+| `*.services.ai.azure.com` | Foundry resource | `{base}/openai/models?api-version=2024-10-21` |
+| `*.openai.azure.com` | Azure OpenAI | `{base}/openai/deployments?api-version=2024-10-21` |
+| Everything else | OpenAI-compatible | `{base}/models` |
+
+### Chat URL construction (providers/openai.rs)
+
+`OpenAiProvider::chat_url()` handles three cases:
+
+| Endpoint type | Chat URL built |
+|---|---|
+| Already contains `/chat/completions` | Used as-is |
+| Foundry project (`/api/projects/`) | **Strips** `/api/projects/...` → `{resource_base}/openai/deployments/{model}/chat/completions?api-version=2024-10-21` |
+| Everything else | `{endpoint}/chat/completions` |
+
+**Critical**: For Foundry projects, the `/api/projects/{name}` path is stripped
+to use the resource-level endpoint. The project-scoped URL does NOT support the
+OpenAI chat completions path. The model/deployment name goes into the URL
+(deployment-based routing), NOT model routing via the request body. This matches
+CutReady's proven production pattern.
+
+### ARM resource discovery (arm_discovery.rs)
+
+Discovers Azure AI resources and their Foundry projects via Azure Resource Manager:
+
+```rust
+// List AI resources in a subscription
+let resources = list_ai_resources(&token, subscription_id).await?;
+// Returns Vec<AiResource> with name, kind, endpoint, resource_group, foundry_url
+
+// List Foundry projects for a resource
+let projects = list_foundry_projects(&token, subscription_id, &resource).await?;
+// Returns Vec<FoundryProject> with name, display_name, endpoint
+```
+
+**AiResource** fields:
+- `name` — resource name
+- `kind` — `"AIServices"`, `"OpenAI"`, `"CognitiveServices"`, etc.
+- `endpoint` — from ARM `properties.endpoint` (e.g., `*.cognitiveservices.azure.com`)
+- `resource_group` — extracted from ARM resource ID
+- `foundry_url` — derived for AIServices: `https://{name}.services.ai.azure.com`
+
+**Dual-strategy project discovery** (`list_foundry_projects`):
+1. **Strategy 1** — CognitiveServices subresource API (`2025-04-01-preview`):
+   `GET .../Microsoft.CognitiveServices/accounts/{name}/projects`
+   Returns projects directly scoped to the resource. ARM returns names as
+   `parent/child` — the code strips to just `child`.
+2. **Strategy 2** (fallback, only if Strategy 1 returns empty) — ML workspaces:
+   `GET .../Microsoft.MachineLearningServices/workspaces?$filter=kind eq 'Project'`
+   Subscription-wide query for classic hub-based projects.
+
+Project endpoint format: `https://{resource}.services.ai.azure.com/api/projects/{project_name}`
+
+### Azure OAuth (azure_oauth.rs)
+
+Browser-based OAuth flow for desktop apps:
+
+```rust
+// Start OAuth flow (opens local HTTP server, returns auth URL)
+let (auth_url, port) = start_auth_code_flow(tenant_id, scope, client_id).await?;
+// Open auth_url in browser, user signs in
+// Wait for callback
+let tokens = wait_for_auth_code(port, tenant_id, scope, client_id).await?;
+
+// Refresh token later
+let new_tokens = refresh_access_token(tenant_id, refresh_token, scope, client_id).await?;
+```
+
+**Scope constants:**
+- `AZURE_MANAGEMENT_SCOPE` — for ARM API calls (resource/project discovery)
+- `AZURE_AI_SCOPE` — for AI inference calls (chat completions)
+
+### Auth strategy (auth.rs)
+
+```rust
+AuthStrategy::ApiKey(key)        // api-key header (Azure) or Bearer (OpenAI)
+AuthStrategy::Bearer(token)      // explicit Bearer token
+AuthStrategy::Dynamic(Arc<fn>)   // closure for Entra token refresh
+```
+
+`OpenAiProvider::new()` auto-detects: Azure endpoints (`azure.com`) get `ApiKey`,
+others get `Bearer`. Use `with_auth()` for explicit control (e.g., Entra tokens).
+
 ## Design decisions
 
 1. **mpsc channel for streaming** — provider writes events to a channel, runner
@@ -424,3 +515,6 @@ agentive = { git = "https://github.com/sethjuarez/agentive", path = "lib" }
 5. **Multimodal from the start** — MessageContent supports text + image parts.
 6. **Context trimming built-in** — automatic, with fast string summarization.
 7. **Sanitization built-in** — strips control chars and base64 from tool results.
+8. **Foundry URL stripping** — project path is stripped for chat because the
+   resource-level endpoint handles deployment routing. Project path is kept
+   for model listing where it provides project-scoped results.
