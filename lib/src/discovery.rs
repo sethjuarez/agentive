@@ -234,7 +234,7 @@ async fn fetch_body(url: &str, auth: &AuthStrategy) -> Result<String, String> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Model list failed ({status}): {body}"));
+        return Err(format!("Model list failed ({status}) at {url}: {body}"));
     }
 
     resp.text()
