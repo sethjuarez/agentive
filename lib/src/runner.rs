@@ -70,6 +70,13 @@ pub struct RunnerConfig {
     /// conditional tool availability.
     /// When `None`, the static `tools` vec passed to `run()` is used every round.
     pub tool_filter: Option<Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>>,
+    /// Unique identifier for this run. Auto-generated UUID v4 if not set.
+    /// Use this to correlate events across logs, traces, and UI.
+    pub run_id: Option<String>,
+    /// Parent run ID for delegation chains. When one `run()` spawns another
+    /// (e.g., via a delegate_to_agent tool), set this to the parent's run_id
+    /// so traces can reconstruct the full call tree.
+    pub parent_run_id: Option<String>,
 }
 
 impl Clone for RunnerConfig {
@@ -83,6 +90,8 @@ impl Clone for RunnerConfig {
             response_format: self.response_format.clone(),
             compaction_provider: self.compaction_provider.clone(),
             tool_filter: self.tool_filter.clone(),
+            run_id: self.run_id.clone(),
+            parent_run_id: self.parent_run_id.clone(),
         }
     }
 }
@@ -98,6 +107,8 @@ impl std::fmt::Debug for RunnerConfig {
             .field("response_format", &self.response_format)
             .field("compaction_provider", &self.compaction_provider.is_some())
             .field("tool_filter", &self.tool_filter.is_some())
+            .field("run_id", &self.run_id)
+            .field("parent_run_id", &self.parent_run_id)
             .finish()
     }
 }
@@ -113,6 +124,8 @@ impl Default for RunnerConfig {
             response_format: None,
             compaction_provider: None,
             tool_filter: None,
+            run_id: None,
+            parent_run_id: None,
         }
     }
 }
@@ -128,9 +141,25 @@ pub enum RunnerEvent {
     /// Status update (e.g., "Thinking…", "Running 3 tool calls…").
     Status { message: String },
     /// A tool is being called.
-    ToolCallStart { name: String, arguments: String },
+    ToolCallStart {
+        name: String,
+        arguments: String,
+        /// The LLM-assigned tool call ID (e.g., "call_abc123").
+        tool_call_id: String,
+        /// Which iteration of the runner loop this occurred in (0-based).
+        iteration: usize,
+    },
     /// A tool returned a result.
-    ToolResult { name: String, result: String },
+    ToolResult {
+        name: String,
+        result: String,
+        /// The LLM-assigned tool call ID, matching the corresponding ToolCallStart.
+        tool_call_id: String,
+        /// Wall-clock time the tool took to execute, in milliseconds.
+        elapsed_ms: u64,
+        /// Which iteration of the runner loop this occurred in (0-based).
+        iteration: usize,
+    },
     /// Token usage for a single LLM call.
     Usage { usage: Usage },
     /// The full message history was updated (after a tool round).
@@ -140,6 +169,8 @@ pub enum RunnerEvent {
     Done {
         response: String,
         messages: Vec<ChatMessage>,
+        /// Total wall-clock time for the entire run, in milliseconds.
+        elapsed_ms: u64,
     },
     /// An error occurred.
     Error { message: String },
@@ -156,6 +187,10 @@ pub struct RunnerResult {
     pub new_messages: Vec<ChatMessage>,
     /// Total token usage across all LLM calls in this run.
     pub total_usage: Usage,
+    /// Unique identifier for this run (for tracing/correlation).
+    pub run_id: String,
+    /// Parent run ID if this was a delegated sub-run.
+    pub parent_run_id: Option<String>,
 }
 
 /// Run the agentic loop: stream LLM → execute tools → loop until done.
@@ -186,6 +221,10 @@ where
     Fut: std::future::Future<Output = Result<String, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
+    let run_id = config.run_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let parent_run_id = config.parent_run_id.clone();
+    let run_start = std::time::Instant::now();
+
     let mut full_messages = messages;
     let mut new_messages: Vec<ChatMessage> = Vec::new();
     let mut total_usage = Usage::default();
@@ -300,6 +339,8 @@ where
                     on_event(RunnerEvent::ToolCallStart {
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
+                        tool_call_id: tool_call.id.clone(),
+                        iteration,
                     });
                 }
                 ChatEvent::Done { response } => {
@@ -357,6 +398,8 @@ where
                                 on_event(RunnerEvent::ToolCallStart {
                                     name: tool_call.function.name.clone(),
                                     arguments: tool_call.function.arguments.clone(),
+                                    tool_call_id: tool_call.id.clone(),
+                                    iteration,
                                 });
                             }
                             ChatEvent::Done { response } => {
@@ -419,9 +462,9 @@ where
 
                 // Execute tool calls (parallel or sequential)
                 let tool_results = if config.parallel_tool_calls && tool_calls.len() > 1 {
-                    execute_tools_parallel(tool_calls, &tool_executor, &config, &guardrails, &on_event).await?
+                    execute_tools_parallel(tool_calls, &tool_executor, &config, &guardrails, &on_event, iteration).await?
                 } else {
-                    execute_tools_sequential(tool_calls, &tool_executor, &config, &guardrails, &on_event).await?
+                    execute_tools_sequential(tool_calls, &tool_executor, &config, &guardrails, &on_event, iteration).await?
                 };
 
                 for tool_msg in &tool_results {
@@ -451,6 +494,7 @@ where
         on_event(RunnerEvent::Done {
             response: final_text.clone(),
             messages: full_messages.clone(),
+            elapsed_ms: run_start.elapsed().as_millis() as u64,
         });
 
         return Ok(RunnerResult {
@@ -458,6 +502,8 @@ where
             response: final_text,
             new_messages,
             total_usage,
+            run_id,
+            parent_run_id,
         });
     }
 
@@ -471,6 +517,7 @@ async fn execute_tools_sequential<F, Fut, E>(
     config: &RunnerConfig,
     guardrails: &Guardrails,
     on_event: &E,
+    iteration: usize,
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync,
@@ -485,12 +532,17 @@ where
             on_event(RunnerEvent::ToolResult {
                 name: tc.function.name.clone(),
                 result: denied_msg.clone(),
+                tool_call_id: tc.id.clone(),
+                elapsed_ms: 0,
+                iteration,
             });
             results.push(ChatMessage::tool_result(&tc.id, &denied_msg));
             continue;
         }
 
+        let tool_start = std::time::Instant::now();
         let (id, name, raw_result) = execute_tool_safe(tc.clone(), tool_executor).await?;
+        let elapsed_ms = tool_start.elapsed().as_millis() as u64;
         let clean = if config.sanitize_tool_results {
             sanitize_for_api(&raw_result)
         } else {
@@ -499,6 +551,9 @@ where
         on_event(RunnerEvent::ToolResult {
             name,
             result: clean.clone(),
+            tool_call_id: id.clone(),
+            elapsed_ms,
+            iteration,
         });
         results.push(ChatMessage::tool_result(&id, &clean));
     }
@@ -512,6 +567,7 @@ async fn execute_tools_parallel<F, Fut, E>(
     config: &RunnerConfig,
     guardrails: &Guardrails,
     on_event: &E,
+    iteration: usize,
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
@@ -525,10 +581,14 @@ where
             GuardrailResult::Allow => None,
         };
         async move {
+            let tool_start = std::time::Instant::now();
             if let Some(reason) = denied {
-                Ok((tc_clone.id.clone(), tc_clone.function.name.clone(), format!("Tool denied by guardrail: {}", reason)))
+                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
+                Ok((tc_clone.id.clone(), tc_clone.function.name.clone(), format!("Tool denied by guardrail: {}", reason), elapsed_ms))
             } else {
-                execute_tool_safe(tc_clone, tool_executor).await
+                let result = execute_tool_safe(tc_clone, tool_executor).await;
+                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
+                result.map(|(id, name, raw)| (id, name, raw, elapsed_ms))
             }
         }
     }).collect();
@@ -537,7 +597,7 @@ where
 
     let mut messages = Vec::with_capacity(tool_calls.len());
     for res in results {
-        let (id, name, raw) = res?;
+        let (id, name, raw, elapsed_ms) = res?;
         let clean = if config.sanitize_tool_results {
             sanitize_for_api(&raw)
         } else {
@@ -546,6 +606,9 @@ where
         on_event(RunnerEvent::ToolResult {
             name,
             result: clean.clone(),
+            tool_call_id: id.clone(),
+            elapsed_ms,
+            iteration,
         });
         messages.push(ChatMessage::tool_result(&id, &clean));
     }
@@ -628,6 +691,17 @@ mod tests {
                     let _ = tx
                         .send(ChatEvent::Token {
                             token: format!("{} ", word),
+                        })
+                        .await;
+                }
+            }
+
+            // Simulate tool call streaming
+            if let Some(ref tool_calls) = response.message.tool_calls {
+                for tc in tool_calls {
+                    let _ = tx
+                        .send(ChatEvent::ToolCallStart {
+                            tool_call: tc.clone(),
                         })
                         .await;
                 }
@@ -2225,5 +2299,111 @@ mod tests {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
         // Filter should have been called 3 times (once per round)
         assert_eq!(filter_call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_run_id_and_observability() {
+        let provider = Arc::new(MockProvider::new(vec![
+            // Tool call round
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "call_abc123".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "my_tool".into(),
+                        arguments: r#"{"key":"val"}"#.into(),
+                    },
+                }]),
+                usage: None,
+            },
+            // Final response
+            ChatResponse {
+                message: ChatMessage::assistant("Done with observability"),
+                usage: None,
+            },
+        ]));
+
+        let events = Arc::new(Mutex::new(Vec::<RunnerEvent>::new()));
+        let events_clone = events.clone();
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("go")],
+            vec![Tool::function("my_tool", "a tool", serde_json::json!({}))],
+            |_| async { Ok("tool output".into()) },
+            RunnerConfig {
+                run_id: Some("test-run-42".into()),
+                parent_run_id: Some("parent-run-1".into()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            move |event| {
+                events_clone.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+        // RunnerResult should carry run_id and parent_run_id
+        assert_eq!(result.run_id, "test-run-42");
+        assert_eq!(result.parent_run_id.as_deref(), Some("parent-run-1"));
+
+        // Check ToolCallStart has tool_call_id and iteration
+        let events = events.lock().unwrap();
+        let tool_start = events.iter().find(|e| matches!(e, RunnerEvent::ToolCallStart { .. }));
+        assert!(tool_start.is_some(), "Should have a ToolCallStart event");
+        if let RunnerEvent::ToolCallStart { name, tool_call_id, iteration, .. } = tool_start.unwrap() {
+            assert_eq!(name, "my_tool");
+            assert_eq!(tool_call_id, "call_abc123");
+            assert_eq!(*iteration, 0); // First round
+        }
+
+        // Check ToolResult has tool_call_id, elapsed_ms, and iteration
+        let tool_result = events.iter().find(|e| matches!(e, RunnerEvent::ToolResult { .. }));
+        assert!(tool_result.is_some(), "Should have a ToolResult event");
+        if let RunnerEvent::ToolResult { name, tool_call_id, elapsed_ms, iteration, .. } = tool_result.unwrap() {
+            assert_eq!(name, "my_tool");
+            assert_eq!(tool_call_id, "call_abc123");
+            assert!(*elapsed_ms < 1000, "Tool should complete quickly in test");
+            assert_eq!(*iteration, 0);
+        }
+
+        // Check Done has elapsed_ms
+        let done = events.iter().find(|e| matches!(e, RunnerEvent::Done { .. }));
+        assert!(done.is_some(), "Should have a Done event");
+        if let RunnerEvent::Done { elapsed_ms, .. } = done.unwrap() {
+            assert!(*elapsed_ms < 5000, "Run should complete quickly in test");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_id_auto_generated() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant("hello"),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("hi")],
+            vec![],
+            |_| async { Ok("".into()) },
+            RunnerConfig::default(), // No run_id set — should auto-generate
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // run_id should be a valid UUID v4 (36 chars with hyphens)
+        assert_eq!(result.run_id.len(), 36, "Auto-generated run_id should be a UUID");
+        assert!(result.run_id.contains('-'), "UUID should contain hyphens");
+        assert!(result.parent_run_id.is_none(), "No parent_run_id by default");
     }
 }

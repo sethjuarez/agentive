@@ -88,10 +88,10 @@ Events emitted by the runner to the consuming app:
 - `Token { token }` — forwarded from provider
 - `Thinking { token }` — forwarded from provider
 - `Status { message }` — "Thinking…", "Running 3 tool calls…", "Compacting context…"
-- `ToolCallStart { name, arguments }` — tool being invoked
-- `ToolResult { name, result }` — tool returned a result
+- `ToolCallStart { name, arguments, tool_call_id, iteration }` — tool being invoked, with LLM-assigned call ID and loop round
+- `ToolResult { name, result, tool_call_id, elapsed_ms, iteration }` — tool returned, with timing and correlation
 - `MessagesUpdated { messages }` — full history after a tool round (for persistence)
-- `Done { response, messages }` — final text + full history
+- `Done { response, messages, elapsed_ms }` — final text + full history + total run time
 - `Error { message }` — error description
 
 ### AgentError
@@ -137,12 +137,16 @@ where
 - `response_format: None` — optional structured output (JSON mode or JSON schema)
 - `compaction_provider: None` — optional LLM provider for richer context compaction
 - `tool_filter: None` — optional per-round tool filter for dynamic tool gating
+- `run_id: None` — auto-generates UUID v4 if not set; use for trace correlation
+- `parent_run_id: None` — set when delegating to link child runs to parent
 
 ### RunnerResult
 - `messages: Vec<ChatMessage>` — full conversation history
 - `response: String` — final assistant text
 - `new_messages: Vec<ChatMessage>` — only messages generated during this run
 - `total_usage: Usage` — accumulated token usage across all LLM calls
+- `run_id: String` — unique identifier for this run (auto-generated or from config)
+- `parent_run_id: Option<String>` — parent run ID if this was a delegated sub-run
 
 ## Provider trait
 
