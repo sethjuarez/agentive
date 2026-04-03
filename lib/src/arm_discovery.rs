@@ -1,0 +1,381 @@
+//! Azure Resource Manager (ARM) discovery for AI resources.
+//!
+//! Lists Azure subscriptions and AI Foundry / Cognitive Services resources
+//! using the ARM API. Requires a token minted for the
+//! `https://management.azure.com/.default` scope.
+//!
+//! # Example
+//! ```no_run
+//! # async fn example() -> Result<(), String> {
+//! use agentive::arm_discovery;
+//!
+//! let mgmt_token = "..."; // from azure_oauth with AZURE_MANAGEMENT_SCOPE
+//!
+//! let subs = arm_discovery::list_subscriptions(mgmt_token).await?;
+//! for s in &subs {
+//!     println!("{}: {}", s.display_name, s.subscription_id);
+//!     let resources = arm_discovery::list_ai_resources(mgmt_token, &s.subscription_id).await?;
+//!     for r in &resources {
+//!         println!("  {} → {}", r.name, r.endpoint);
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// An Azure subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    /// The subscription GUID.
+    pub subscription_id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Subscription state (e.g. "Enabled", "Disabled").
+    pub state: String,
+}
+
+/// An Azure AI resource (Cognitive Services account).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiResource {
+    /// Resource name.
+    pub name: String,
+    /// Resource kind (e.g. "AIServices", "OpenAI").
+    pub kind: String,
+    /// The inference endpoint URL.
+    pub endpoint: String,
+    /// Azure region (e.g. "eastus").
+    pub location: String,
+    /// Resource group name.
+    pub resource_group: String,
+}
+
+// ---------------------------------------------------------------------------
+// ARM response shapes (private)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ArmListResponse<T> {
+    value: Vec<T>,
+    #[serde(default, rename = "nextLink")]
+    next_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArmSubscription {
+    subscription_id: String,
+    display_name: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmCogAccount {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    properties: Option<ArmCogProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmCogProperties {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    endpoints: Option<std::collections::HashMap<String, String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+const ARM_BASE: &str = "https://management.azure.com";
+
+/// List Azure subscriptions accessible to the authenticated user.
+pub async fn list_subscriptions(token: &str) -> Result<Vec<Subscription>, String> {
+    let url = format!("{ARM_BASE}/subscriptions?api-version=2022-12-01");
+    let items = fetch_all_pages::<ArmSubscription>(token, &url).await?;
+    Ok(items
+        .into_iter()
+        .filter(|s| s.state == "Enabled")
+        .map(|s| Subscription {
+            subscription_id: s.subscription_id,
+            display_name: s.display_name,
+            state: s.state,
+        })
+        .collect())
+}
+
+/// List AI resources (Cognitive Services accounts) in a subscription.
+///
+/// Filters to resources of kind `AIServices` or `OpenAI` that have
+/// a usable inference endpoint.
+pub async fn list_ai_resources(
+    token: &str,
+    subscription_id: &str,
+) -> Result<Vec<AiResource>, String> {
+    let url = format!(
+        "{ARM_BASE}/subscriptions/{subscription_id}/providers/\
+         Microsoft.CognitiveServices/accounts?api-version=2023-05-01"
+    );
+    let items = fetch_all_pages::<ArmCogAccount>(token, &url).await?;
+    Ok(items
+        .into_iter()
+        .filter_map(|a| {
+            let kind = a.kind.unwrap_or_default();
+            if kind != "AIServices" && kind != "OpenAI" {
+                return None;
+            }
+            let endpoint = a
+                .properties
+                .as_ref()
+                .and_then(|p| {
+                    p.endpoint.clone().or_else(|| {
+                        p.endpoints
+                            .as_ref()
+                            .and_then(|e| e.get("OpenAI Language Model Instance API").cloned())
+                    })
+                })
+                .unwrap_or_default();
+            if endpoint.is_empty() {
+                return None;
+            }
+            // Extract resource group from the ARM resource id
+            let rg = a
+                .id
+                .as_deref()
+                .and_then(extract_resource_group)
+                .unwrap_or_default();
+            Some(AiResource {
+                name: a.name,
+                kind,
+                endpoint,
+                location: a.location.unwrap_or_default(),
+                resource_group: rg,
+            })
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the resource group from an ARM resource ID.
+fn extract_resource_group(id: &str) -> Option<String> {
+    // Format: /subscriptions/{sub}/resourceGroups/{rg}/providers/...
+    let lower = id.to_lowercase();
+    let idx = lower.find("/resourcegroups/")?;
+    let rest = &id[idx + "/resourceGroups/".len()..];
+    Some(rest.split('/').next()?.to_string())
+}
+
+/// Fetch all pages from a paginated ARM API response.
+async fn fetch_all_pages<T: serde::de::DeserializeOwned>(
+    token: &str,
+    initial_url: &str,
+) -> Result<Vec<T>, String> {
+    let http = reqwest::Client::new();
+    let mut all = Vec::new();
+    let mut url = initial_url.to_string();
+
+    loop {
+        let resp = http
+            .get(&url)
+            .bearer_auth(token)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("ARM request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("ARM API error ({status}): {body}"));
+        }
+
+        let page: ArmListResponse<T> = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse ARM response: {e}"))?;
+
+        all.extend(page.value);
+
+        match page.next_link {
+            Some(next) if !next.is_empty() => url = next,
+            _ => break,
+        }
+    }
+
+    Ok(all)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_resource_group() {
+        let id = "/subscriptions/abc-123/resourceGroups/my-rg/providers/Microsoft.CognitiveServices/accounts/my-ai";
+        assert_eq!(
+            extract_resource_group(id),
+            Some("my-rg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_resource_group_case_insensitive() {
+        let id = "/subscriptions/abc/resourcegroups/MyRG/providers/Foo";
+        assert_eq!(
+            extract_resource_group(id),
+            Some("MyRG".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_resource_group_missing() {
+        assert_eq!(extract_resource_group("/subscriptions/abc"), None);
+        assert_eq!(extract_resource_group(""), None);
+    }
+
+    #[test]
+    fn test_parse_subscriptions_response() {
+        let body = r#"{"value":[
+            {"subscriptionId":"sub-1","displayName":"Dev","state":"Enabled"},
+            {"subscriptionId":"sub-2","displayName":"Prod","state":"Enabled"},
+            {"subscriptionId":"sub-3","displayName":"Disabled","state":"Disabled"}
+        ]}"#;
+        let parsed: ArmListResponse<ArmSubscription> = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.value.len(), 3);
+        assert_eq!(parsed.value[0].subscription_id, "sub-1");
+        assert_eq!(parsed.value[0].display_name, "Dev");
+    }
+
+    #[test]
+    fn test_parse_cog_accounts_response() {
+        let body = r#"{"value":[
+            {
+                "name":"my-ai-services",
+                "kind":"AIServices",
+                "location":"eastus",
+                "id":"/subscriptions/sub-1/resourceGroups/my-rg/providers/Microsoft.CognitiveServices/accounts/my-ai-services",
+                "properties":{
+                    "endpoint":"https://my-ai-services.cognitiveservices.azure.com/"
+                }
+            },
+            {
+                "name":"my-openai",
+                "kind":"OpenAI",
+                "location":"westus",
+                "id":"/subscriptions/sub-1/resourceGroups/rg2/providers/Microsoft.CognitiveServices/accounts/my-openai",
+                "properties":{
+                    "endpoint":"https://my-openai.openai.azure.com/"
+                }
+            },
+            {
+                "name":"my-search",
+                "kind":"CognitiveSearch",
+                "location":"eastus",
+                "id":"/subscriptions/sub-1/resourceGroups/rg3/providers/Microsoft.CognitiveServices/accounts/my-search",
+                "properties":{}
+            }
+        ]}"#;
+        let parsed: ArmListResponse<ArmCogAccount> = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.value.len(), 3);
+
+        // Filter like list_ai_resources does
+        let resources: Vec<_> = parsed
+            .value
+            .into_iter()
+            .filter_map(|a| {
+                let kind = a.kind.unwrap_or_default();
+                if kind != "AIServices" && kind != "OpenAI" {
+                    return None;
+                }
+                let endpoint = a.properties.as_ref().and_then(|p| p.endpoint.clone()).unwrap_or_default();
+                if endpoint.is_empty() { return None; }
+                let rg = a.id.as_deref().and_then(extract_resource_group).unwrap_or_default();
+                Some(AiResource {
+                    name: a.name,
+                    kind,
+                    endpoint,
+                    location: a.location.unwrap_or_default(),
+                    resource_group: rg,
+                })
+            })
+            .collect();
+
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].name, "my-ai-services");
+        assert_eq!(resources[0].kind, "AIServices");
+        assert_eq!(
+            resources[0].endpoint,
+            "https://my-ai-services.cognitiveservices.azure.com/"
+        );
+        assert_eq!(resources[0].resource_group, "my-rg");
+        assert_eq!(resources[1].name, "my-openai");
+        assert_eq!(resources[1].kind, "OpenAI");
+    }
+
+    #[test]
+    fn test_parse_cog_accounts_with_endpoints_map() {
+        let body = r#"{"value":[{
+            "name":"foundry-svc",
+            "kind":"AIServices",
+            "location":"eastus2",
+            "id":"/subscriptions/s1/resourceGroups/rg1/providers/Microsoft.CognitiveServices/accounts/foundry-svc",
+            "properties":{
+                "endpoints":{
+                    "OpenAI Language Model Instance API":"https://foundry-svc.openai.azure.com/"
+                }
+            }
+        }]}"#;
+        let parsed: ArmListResponse<ArmCogAccount> = serde_json::from_str(body).unwrap();
+        let a = &parsed.value[0];
+        let endpoint = a
+            .properties
+            .as_ref()
+            .and_then(|p| {
+                p.endpoint.clone().or_else(|| {
+                    p.endpoints
+                        .as_ref()
+                        .and_then(|e| e.get("OpenAI Language Model Instance API").cloned())
+                })
+            })
+            .unwrap_or_default();
+        assert_eq!(endpoint, "https://foundry-svc.openai.azure.com/");
+    }
+
+    #[test]
+    fn test_parse_empty_response() {
+        let body = r#"{"value":[]}"#;
+        let parsed: ArmListResponse<ArmSubscription> = serde_json::from_str(body).unwrap();
+        assert!(parsed.value.is_empty());
+        assert!(parsed.next_link.is_none());
+    }
+
+    #[test]
+    fn test_parse_with_next_link() {
+        let body = r#"{"value":[{"subscriptionId":"s1","displayName":"A","state":"Enabled"}],"nextLink":"https://management.azure.com/next?page=2"}"#;
+        let parsed: ArmListResponse<ArmSubscription> = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.value.len(), 1);
+        assert_eq!(
+            parsed.next_link.as_deref(),
+            Some("https://management.azure.com/next?page=2")
+        );
+    }
+}

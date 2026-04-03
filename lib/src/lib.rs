@@ -30,6 +30,7 @@
 //! # }
 //! ```
 
+pub mod arm_discovery;
 pub mod auth;
 pub mod azure_oauth;
 pub mod cancel;

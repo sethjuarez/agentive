@@ -25,12 +25,12 @@
 //! // 4. Exchange code for tokens
 //! let redirect_uri = format!("http://localhost:{}", init.port);
 //! let tokens = azure_oauth::exchange_code_for_token(
-//!     "organizations", &code, &redirect_uri, &verifier, None,
+//!     "organizations", &code, &redirect_uri, &verifier, None, None,
 //! ).await?;
 //!
 //! // 5. Later, refresh the token
 //! let fresh = azure_oauth::refresh_token(
-//!     "organizations", tokens.refresh_token.as_deref().unwrap(), None,
+//!     "organizations", tokens.refresh_token.as_deref().unwrap(), None, None,
 //! ).await?;
 //! # Ok(())
 //! # }
@@ -44,6 +44,10 @@ use tokio::net::TcpListener;
 
 /// Default scope for Azure OpenAI / AI Services.
 pub const AZURE_OPENAI_SCOPE: &str = "https://ai.azure.com/.default offline_access";
+
+/// Scope for Azure Resource Manager (ARM) API — subscription/resource discovery.
+pub const AZURE_MANAGEMENT_SCOPE: &str =
+    "https://management.azure.com/.default offline_access";
 
 /// Azure PowerShell first-party client ID — works for cognitive services scopes.
 pub const DEFAULT_CLIENT_ID: &str = "1950a258-227b-4e31-a9cf-717495945fc2";
@@ -245,14 +249,19 @@ pub async fn wait_for_auth_code(
 }
 
 /// Exchange an authorization code for tokens.
+///
+/// The `scope` parameter controls which resource the token is minted for.
+/// Pass `None` to use the default Azure OpenAI scope.
 pub async fn exchange_code_for_token(
     tenant_id: &str,
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
     client_id: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<TokenResponse, String> {
     let cid = client_id.unwrap_or(DEFAULT_CLIENT_ID);
+    let scp = scope.unwrap_or(AZURE_OPENAI_SCOPE);
     let url = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         tenant_id
@@ -267,7 +276,7 @@ pub async fn exchange_code_for_token(
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("code_verifier", code_verifier),
-            ("scope", AZURE_OPENAI_SCOPE),
+            ("scope", scp),
         ])
         .send()
         .await
@@ -288,12 +297,18 @@ pub async fn exchange_code_for_token(
 // ---------------------------------------------------------------------------
 
 /// Refresh an access token using a refresh token.
+///
+/// Pass a different `scope` to swap the token audience (e.g. switch
+/// from ARM management scope to AI Services scope using the same
+/// refresh token).
 pub async fn refresh_token(
     tenant_id: &str,
     refresh_token: &str,
     client_id: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<TokenResponse, String> {
     let cid = client_id.unwrap_or(DEFAULT_CLIENT_ID);
+    let scp = scope.unwrap_or(AZURE_OPENAI_SCOPE);
     let url = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         tenant_id
@@ -306,7 +321,7 @@ pub async fn refresh_token(
             ("client_id", cid),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("scope", AZURE_OPENAI_SCOPE),
+            ("scope", scp),
         ])
         .send()
         .await
@@ -338,8 +353,10 @@ struct TokenErrorResponse {
 pub async fn request_device_code(
     tenant_id: &str,
     client_id: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<DeviceCodeResponse, String> {
     let cid = client_id.unwrap_or(DEFAULT_CLIENT_ID);
+    let scp = scope.unwrap_or(AZURE_OPENAI_SCOPE);
     let url = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/devicecode",
         tenant_id
@@ -348,7 +365,7 @@ pub async fn request_device_code(
     let http = reqwest::Client::new();
     let resp = http
         .post(&url)
-        .form(&[("client_id", cid), ("scope", AZURE_OPENAI_SCOPE)])
+        .form(&[("client_id", cid), ("scope", scp)])
         .send()
         .await
         .map_err(|e| format!("Device code request failed: {e}"))?;
