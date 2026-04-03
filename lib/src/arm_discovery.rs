@@ -127,6 +127,20 @@ struct ArmMlWorkspaceProperties {
     friendly_name: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ArmCogProject {
+    name: String,
+    #[serde(default)]
+    properties: Option<ArmCogProjectProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArmCogProjectProperties {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -206,39 +220,71 @@ pub async fn list_ai_resources(
         .collect())
 }
 
-/// List Foundry projects within a resource group.
+/// List Foundry projects for an AI Services resource.
 ///
-/// Queries `Microsoft.MachineLearningServices/workspaces` and filters to
-/// `kind == "Project"`. Returns project endpoints constructed from the
-/// AI Services resource name.
+/// Tries two discovery strategies:
+/// 1. **New Foundry**: `CognitiveServices/accounts/{name}/projects` (direct child resources)
+/// 2. **Classic hub**: `MachineLearningServices/workspaces` (kind=Project, subscription-wide)
+///
+/// Results are merged, with new Foundry projects taking priority.
 pub async fn list_foundry_projects(
     token: &str,
     subscription_id: &str,
     resource_group: &str,
     resource_name: &str,
 ) -> Result<Vec<FoundryProject>, String> {
-    let url = format!(
+    let base_url = format!("https://{resource_name}.services.ai.azure.com");
+    let mut projects = Vec::new();
+
+    // Strategy 1: New Foundry projects (CognitiveServices subresource)
+    let cog_url = format!(
         "{ARM_BASE}/subscriptions/{subscription_id}/resourceGroups/{resource_group}/\
-         providers/Microsoft.MachineLearningServices/workspaces?api-version=2024-10-01"
+         providers/Microsoft.CognitiveServices/accounts/{resource_name}/\
+         projects?api-version=2025-04-01-preview"
     );
-    let items = fetch_all_pages::<ArmMlWorkspace>(token, &url).await?;
-    let base = format!("https://{resource_name}.services.ai.azure.com");
-    Ok(items
-        .into_iter()
-        .filter(|w| w.kind.as_deref() == Some("Project"))
-        .map(|w| {
-            let display = w
+    if let Ok(items) = fetch_all_pages::<ArmCogProject>(token, &cog_url).await {
+        projects.extend(items.into_iter().map(|p| {
+            let display = p
                 .properties
                 .as_ref()
-                .and_then(|p| p.friendly_name.clone())
-                .unwrap_or_else(|| w.name.clone());
+                .and_then(|props| props.display_name.clone())
+                .unwrap_or_else(|| p.name.clone());
             FoundryProject {
-                endpoint: format!("{base}/api/projects/{}", w.name),
+                endpoint: format!("{base_url}/api/projects/{}", p.name),
                 display_name: display,
-                name: w.name,
+                name: p.name,
             }
-        })
-        .collect())
+        }));
+    }
+
+    // Strategy 2: Classic hub-based projects (ML workspaces, subscription-wide)
+    let ml_url = format!(
+        "{ARM_BASE}/subscriptions/{subscription_id}/\
+         providers/Microsoft.MachineLearningServices/workspaces?api-version=2024-10-01"
+    );
+    if let Ok(items) = fetch_all_pages::<ArmMlWorkspace>(token, &ml_url).await {
+        let classic_projects: Vec<_> = items
+            .into_iter()
+            .filter(|w| w.kind.as_deref() == Some("Project"))
+            // Skip any that already came from the CogServices query
+            .filter(|w| !projects.iter().any(|existing| existing.name == w.name))
+            .map(|w| {
+                let display = w
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.friendly_name.clone())
+                    .unwrap_or_else(|| w.name.clone());
+                FoundryProject {
+                    endpoint: format!("{base_url}/api/projects/{}", w.name),
+                    display_name: display,
+                    name: w.name,
+                }
+            })
+            .collect();
+        projects.extend(classic_projects);
+    }
+
+    Ok(projects)
 }
 
 // ---------------------------------------------------------------------------
@@ -505,5 +551,43 @@ mod tests {
         // When no friendly_name, falls back to workspace name
         assert_eq!(projects[1].name, "prod-models");
         assert_eq!(projects[1].display_name, "prod-models");
+    }
+
+    #[test]
+    fn test_parse_cog_projects_response() {
+        let body = r#"{"value":[
+            {"name":"dev-models","properties":{"displayName":"Dev Models"}},
+            {"name":"staging","properties":{}}
+        ]}"#;
+        let parsed: ArmListResponse<ArmCogProject> = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.value.len(), 2);
+
+        let base = "https://seth-foundry-dev.services.ai.azure.com";
+        let projects: Vec<_> = parsed
+            .value
+            .into_iter()
+            .map(|p| {
+                let display = p
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.display_name.clone())
+                    .unwrap_or_else(|| p.name.clone());
+                FoundryProject {
+                    endpoint: format!("{base}/api/projects/{}", p.name),
+                    display_name: display,
+                    name: p.name,
+                }
+            })
+            .collect();
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name, "dev-models");
+        assert_eq!(projects[0].display_name, "Dev Models");
+        assert_eq!(
+            projects[0].endpoint,
+            "https://seth-foundry-dev.services.ai.azure.com/api/projects/dev-models"
+        );
+        assert_eq!(projects[1].name, "staging");
+        assert_eq!(projects[1].display_name, "staging");
     }
 }
