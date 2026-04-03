@@ -244,44 +244,47 @@ pub async fn list_foundry_projects(
     );
     if let Ok(items) = fetch_all_pages::<ArmCogProject>(token, &cog_url).await {
         projects.extend(items.into_iter().map(|p| {
+            // ARM returns subresource names as "parent/child" — strip the parent prefix
+            let short_name = p.name.rsplit('/').next().unwrap_or(&p.name).to_string();
             let display = p
                 .properties
                 .as_ref()
                 .and_then(|props| props.display_name.clone())
-                .unwrap_or_else(|| p.name.clone());
+                .unwrap_or_else(|| short_name.clone());
             FoundryProject {
-                endpoint: format!("{base_url}/api/projects/{}", p.name),
+                endpoint: format!("{base_url}/api/projects/{short_name}"),
                 display_name: display,
-                name: p.name,
+                name: short_name,
             }
         }));
     }
 
-    // Strategy 2: Classic hub-based projects (ML workspaces, subscription-wide)
-    let ml_url = format!(
-        "{ARM_BASE}/subscriptions/{subscription_id}/\
-         providers/Microsoft.MachineLearningServices/workspaces?api-version=2024-10-01"
-    );
-    if let Ok(items) = fetch_all_pages::<ArmMlWorkspace>(token, &ml_url).await {
-        let classic_projects: Vec<_> = items
-            .into_iter()
-            .filter(|w| w.kind.as_deref() == Some("Project"))
-            // Skip any that already came from the CogServices query
-            .filter(|w| !projects.iter().any(|existing| existing.name == w.name))
-            .map(|w| {
-                let display = w
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.friendly_name.clone())
-                    .unwrap_or_else(|| w.name.clone());
-                FoundryProject {
-                    endpoint: format!("{base_url}/api/projects/{}", w.name),
-                    display_name: display,
-                    name: w.name,
-                }
-            })
-            .collect();
-        projects.extend(classic_projects);
+    // Strategy 2 (fallback): Classic hub-based projects (ML workspaces, subscription-wide).
+    // Only used when the CogServices query returned nothing (e.g. older hub-based setup).
+    if projects.is_empty() {
+        let ml_url = format!(
+            "{ARM_BASE}/subscriptions/{subscription_id}/\
+             providers/Microsoft.MachineLearningServices/workspaces?api-version=2024-10-01"
+        );
+        if let Ok(items) = fetch_all_pages::<ArmMlWorkspace>(token, &ml_url).await {
+            let classic_projects: Vec<_> = items
+                .into_iter()
+                .filter(|w| w.kind.as_deref() == Some("Project"))
+                .map(|w| {
+                    let display = w
+                        .properties
+                        .as_ref()
+                        .and_then(|p| p.friendly_name.clone())
+                        .unwrap_or_else(|| w.name.clone());
+                    FoundryProject {
+                        endpoint: format!("{base_url}/api/projects/{}", w.name),
+                        display_name: display,
+                        name: w.name,
+                    }
+                })
+                .collect();
+            projects.extend(classic_projects);
+        }
     }
 
     Ok(projects)
@@ -555,9 +558,10 @@ mod tests {
 
     #[test]
     fn test_parse_cog_projects_response() {
+        // ARM returns subresource names as "parent/child"
         let body = r#"{"value":[
-            {"name":"dev-models","properties":{"displayName":"Dev Models"}},
-            {"name":"staging","properties":{}}
+            {"name":"seth-foundry-dev/dev-models","properties":{"displayName":"Dev Models"}},
+            {"name":"seth-foundry-dev/staging","properties":{}}
         ]}"#;
         let parsed: ArmListResponse<ArmCogProject> = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.value.len(), 2);
@@ -567,15 +571,16 @@ mod tests {
             .value
             .into_iter()
             .map(|p| {
+                let short_name = p.name.rsplit('/').next().unwrap_or(&p.name).to_string();
                 let display = p
                     .properties
                     .as_ref()
                     .and_then(|props| props.display_name.clone())
-                    .unwrap_or_else(|| p.name.clone());
+                    .unwrap_or_else(|| short_name.clone());
                 FoundryProject {
-                    endpoint: format!("{base}/api/projects/{}", p.name),
+                    endpoint: format!("{base}/api/projects/{short_name}"),
                     display_name: display,
-                    name: p.name,
+                    name: short_name,
                 }
             })
             .collect();
@@ -587,6 +592,7 @@ mod tests {
             projects[0].endpoint,
             "https://seth-foundry-dev.services.ai.azure.com/api/projects/dev-models"
         );
+        // When no displayName, falls back to short name
         assert_eq!(projects[1].name, "staging");
         assert_eq!(projects[1].display_name, "staging");
     }
