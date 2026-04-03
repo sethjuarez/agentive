@@ -120,7 +120,7 @@ struct FoundryDeploymentModel {
 }
 
 // ---------------------------------------------------------------------------
-// Endpoint detection
+// Endpoint detection & normalization
 // ---------------------------------------------------------------------------
 
 /// Returns true if the endpoint looks like Azure AI Foundry.
@@ -131,6 +131,14 @@ fn is_foundry(endpoint: &str) -> bool {
 /// Returns true if the endpoint looks like Azure OpenAI (not Foundry).
 fn is_azure_openai(endpoint: &str) -> bool {
     endpoint.contains(".openai.azure.com") || endpoint.contains(".cognitiveservices.azure.com")
+}
+
+/// Rewrite `*.cognitiveservices.azure.com` → `*.openai.azure.com`.
+///
+/// The ARM API often returns the generic Cognitive Services endpoint, but the
+/// `/openai/deployments` API only lives on the `openai.azure.com` host.
+fn normalize_azure_endpoint(endpoint: &str) -> String {
+    endpoint.replace(".cognitiveservices.azure.com", ".openai.azure.com")
 }
 
 /// Strip any `/api/projects/...` suffix from a Foundry endpoint.
@@ -171,7 +179,8 @@ async fn list_models_azure(
     endpoint: &str,
     auth: &AuthStrategy,
 ) -> Result<Vec<ModelInfo>, String> {
-    let url = format!("{}/openai/deployments?api-version=2024-10-21", endpoint);
+    let endpoint = normalize_azure_endpoint(endpoint);
+    let url = format!("{endpoint}/openai/deployments?api-version=2024-10-21");
     let body = fetch_body(&url, auth).await?;
     parse_azure_deployments(&body)
 }
@@ -411,5 +420,39 @@ mod tests {
     fn test_parse_empty_responses() {
         assert!(parse_openai_models(r#"{"data":[]}"#).unwrap().is_empty());
         assert!(parse_foundry_project_deployments(r#"{"value":[]}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_normalize_azure_endpoint_cognitiveservices() {
+        assert_eq!(
+            normalize_azure_endpoint("https://my-resource.cognitiveservices.azure.com"),
+            "https://my-resource.openai.azure.com"
+        );
+    }
+
+    #[test]
+    fn test_normalize_azure_endpoint_with_trailing_slash() {
+        assert_eq!(
+            normalize_azure_endpoint("https://my-resource.cognitiveservices.azure.com/"),
+            "https://my-resource.openai.azure.com/"
+        );
+    }
+
+    #[test]
+    fn test_normalize_azure_endpoint_already_openai() {
+        // Should be a no-op when it's already openai.azure.com
+        assert_eq!(
+            normalize_azure_endpoint("https://my-resource.openai.azure.com"),
+            "https://my-resource.openai.azure.com"
+        );
+    }
+
+    #[test]
+    fn test_normalize_azure_endpoint_non_azure() {
+        // Should be a no-op for non-Azure endpoints
+        assert_eq!(
+            normalize_azure_endpoint("https://api.openai.com"),
+            "https://api.openai.com"
+        );
     }
 }
