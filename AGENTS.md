@@ -12,12 +12,13 @@ consuming apps only need to define their tools and wire up their UI.
 
 ## Crate structure
 
-```
+```text
 lib/src/
 ├── lib.rs                  # Re-exports all public API
-├── types.rs                # Core types: ChatMessage, ToolCall, Tool, ChatEvent, etc.
+├── types.rs                # Core types: ChatMessage, ToolCall, Tool, ChatEvent, Usage, etc.
 ├── error.rs                # AgentError enum
 ├── cancel.rs               # CancellationToken (Arc<AtomicBool> wrapper)
+├── auth.rs                 # AuthStrategy enum (ApiKey, Bearer, Dynamic)
 ├── provider.rs             # Provider trait definition
 ├── factory.rs              # Provider factory — auto-routing from model name
 ├── steering.rs             # Steering — inject user messages mid-run
@@ -29,9 +30,12 @@ lib/src/
 │   ├── responses.rs        # OpenAI Responses API provider (/v1/responses)
 │   ├── anthropic.rs        # Anthropic Messages API provider
 │   └── sse.rs              # Shared SSE line parser
-├── runner.rs               # Agentic loop: run() function
-├── context.rs              # Context window trimming + summarization
-└── sanitize.rs             # Tool result sanitization
+├── runner.rs               # Agentic loop: run(), RunnerConfig, RunnerEvent, @reference resolver
+├── context.rs              # Context window trimming + LLM-powered summarization
+├── sanitize.rs             # Tool result sanitization
+├── discovery.rs            # Model listing across endpoint types
+├── arm_discovery.rs        # Azure subscription/resource/project discovery via ARM
+└── azure_oauth.rs          # OAuth PKCE + device code flows for Entra ID
 ```
 
 ## Key types
@@ -75,6 +79,57 @@ Tool::function("tool_name", "description", serde_json::json!({
 // arguments is a JSON string that needs to be parsed by the executor
 ```
 
+### Supporting types
+
+```rust
+// MessageContent — text or multimodal parts
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+// ContentPart — text or image in multimodal messages
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+// ImageUrl — for vision-capable models
+struct ImageUrl {
+    url: String,          // URL or base64 data URI
+    detail: Option<String>, // "low", "high", or "auto"
+}
+
+// ToolFunction — definition inside a Tool
+struct ToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value, // JSON Schema
+}
+
+// Usage — token consumption per LLM call
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+// ChatRequest — sent to providers (usually constructed by the runner)
+struct ChatRequest {
+    messages: Vec<ChatMessage>,
+    model: String,
+    tools: Option<Vec<Tool>>,
+    stream: bool,
+    response_format: Option<ResponseFormat>,
+}
+
+// ChatResponse — returned by providers after streaming completes
+struct ChatResponse {
+    message: ChatMessage,
+    usage: Option<Usage>,
+}
+```
+
 ### ChatEvent (provider → runner)
 Events emitted by providers during streaming:
 - `Token { token }` — text delta
@@ -90,21 +145,24 @@ Events emitted by the runner to the consuming app:
 - `Status { message }` — "Thinking…", "Running 3 tool calls…", "Compacting context…"
 - `ToolCallStart { name, arguments, tool_call_id, iteration }` — tool being invoked, with LLM-assigned call ID and loop round
 - `ToolResult { name, result, tool_call_id, elapsed_ms, iteration }` — tool returned, with timing and correlation
+- `Usage { usage }` — token usage after each LLM call (`Usage { prompt_tokens, completion_tokens, total_tokens }`)
 - `MessagesUpdated { messages }` — full history after a tool round (for persistence)
 - `Done { response, messages, elapsed_ms }` — final text + full history + total run time
 - `Error { message }` — error description
 
 ### AgentError
 ```rust
-AgentError::NotConfigured(String)    // missing API key/endpoint
-AgentError::Http(reqwest::Error)     // transport error
-AgentError::Stream(String)           // SSE processing error
-AgentError::Json(serde_json::Error)  // serialization error
-AgentError::Tool(String)             // tool execution error
-AgentError::Storage(String)          // persistence error
-AgentError::Cancelled                // user cancelled
-AgentError::Api { status, message }  // non-2xx API response
-AgentError::MaxIterations(usize)     // exceeded tool loop limit
+AgentError::NotConfigured(String)         // missing API key/endpoint
+AgentError::Http(reqwest::Error)          // transport error
+AgentError::Stream(String)                // SSE processing error
+AgentError::Json(serde_json::Error)       // serialization error
+AgentError::Tool(String)                  // tool execution error
+AgentError::ToolPanic { name, message }   // tool panicked during execution
+AgentError::Storage(String)               // persistence error
+AgentError::Cancelled                     // user cancelled
+AgentError::Api { status, message }       // non-2xx API response
+AgentError::MaxIterations(usize)          // exceeded tool loop limit
+AgentError::Guardrailed(String)           // blocked by input/output guardrail
 ```
 
 ## Core function: `agentive::run()`
@@ -139,6 +197,7 @@ where
 - `tool_filter: None` — optional per-round tool filter for dynamic tool gating
 - `run_id: None` — auto-generates UUID v4 if not set; use for trace correlation
 - `parent_run_id: None` — set when delegating to link child runs to parent
+- `reference_resolver: None` — optional async resolver for `@reference` syntax in user messages
 
 ### RunnerResult
 - `messages: Vec<ChatMessage>` — full conversation history
@@ -594,17 +653,33 @@ CutReady's proven production pattern.
 Discovers Azure AI resources and their Foundry projects via Azure Resource Manager:
 
 ```rust
+use agentive::arm_discovery::*;
+
+// List Azure subscriptions
+let subs = list_subscriptions(&token).await?;
+// Returns Vec<Subscription> with subscription_id, display_name, state
+
 // List AI resources in a subscription
-let resources = list_ai_resources(&token, subscription_id).await?;
+let resources = list_ai_resources(&token, &subs[0].subscription_id).await?;
 // Returns Vec<AiResource> with name, kind, endpoint, resource_group, foundry_url
 
-// List Foundry projects for a resource
-let projects = list_foundry_projects(&token, subscription_id, &resource).await?;
+// List Foundry projects for a specific resource
+let projects = list_foundry_projects(
+    &token,
+    &subs[0].subscription_id,
+    &resources[0].resource_group,
+    &resources[0].name,
+).await?;
 // Returns Vec<FoundryProject> with name, display_name, endpoint
 ```
 
-**AiResource** fields:
-- `name` — resource name
+**Types:**
+
+- `Subscription` — `subscription_id`, `display_name`, `state`
+- `AiResource` — `name`, `kind`, `endpoint`, `location`, `resource_group`, `foundry_url`
+- `FoundryProject` — `name`, `display_name`, `endpoint`
+
+**AiResource details:**
 - `kind` — `"AIServices"`, `"OpenAI"`, `"CognitiveServices"`, etc.
 - `endpoint` — from ARM `properties.endpoint` (e.g., `*.cognitiveservices.azure.com`)
 - `resource_group` — extracted from ARM resource ID
@@ -621,24 +696,70 @@ let projects = list_foundry_projects(&token, subscription_id, &resource).await?;
 
 Project endpoint format: `https://{resource}.services.ai.azure.com/api/projects/{project_name}`
 
-### Azure OAuth (azure_oauth.rs)
-
-Browser-based OAuth flow for desktop apps:
+### Model discovery types (discovery.rs)
 
 ```rust
-// Start OAuth flow (opens local HTTP server, returns auth URL)
-let (auth_url, port) = start_auth_code_flow(tenant_id, scope, client_id).await?;
-// Open auth_url in browser, user signs in
-// Wait for callback
-let tokens = wait_for_auth_code(port, tenant_id, scope, client_id).await?;
-
-// Refresh token later
-let new_tokens = refresh_access_token(tenant_id, refresh_token, scope, client_id).await?;
+pub struct ModelInfo {
+    pub id: String,
+    pub owned_by: Option<String>,
+    pub capabilities: Option<HashMap<String, String>>,
+    pub context_length: Option<usize>,
+}
 ```
 
+### Azure OAuth (azure_oauth.rs)
+
+Two authentication flows for desktop apps:
+
+**Browser-based (auth code + PKCE):**
+
+```rust
+use agentive::azure_oauth::*;
+
+// 1. Start flow — opens local HTTP server, returns auth URL + PKCE verifier
+let (init, code_verifier) = start_auth_code_flow(tenant_id, None, None).await?;
+// init.auth_url — open in browser for user sign-in
+// init.port — local callback port
+
+// 2. Wait for browser callback
+let auth_code = wait_for_auth_code(init.port, 120, "MyApp").await?;
+
+// 3. Exchange code for tokens
+let tokens = exchange_code_for_token(
+    tenant_id, &auth_code,
+    &format!("http://localhost:{}", init.port),
+    &code_verifier, None, None,
+).await?;
+// tokens.access_token, tokens.refresh_token
+
+// 4. Refresh later
+let new_tokens = refresh_token(tenant_id, &tokens.refresh_token.unwrap(), None, None).await?;
+```
+
+**Device code (headless/CLI):**
+
+```rust
+use agentive::azure_oauth::*;
+
+// 1. Request device code — show user_code + verification_uri to user
+let device = request_device_code(tenant_id, None, None).await?;
+println!("{}", device.message); // "Go to https://... and enter code ABC-123"
+
+// 2. Poll until user completes sign-in
+let tokens = poll_for_token(
+    tenant_id, &device.device_code, device.interval, device.expires_in, None,
+).await?;
+```
+
+**Types:**
+- `TokenResponse` — `access_token`, `token_type`, `expires_in`, `refresh_token`, `scope`
+- `AuthCodeFlowInit` — `auth_url`, `port`
+- `DeviceCodeResponse` — `device_code`, `user_code`, `verification_uri`, `expires_in`, `interval`, `message`
+
 **Scope constants:**
-- `AZURE_MANAGEMENT_SCOPE` — for ARM API calls (resource/project discovery)
-- `AZURE_AI_SCOPE` — for AI inference calls (chat completions)
+- `AZURE_OPENAI_SCOPE` — for AI inference calls (`https://ai.azure.com/.default offline_access`)
+- `AZURE_MANAGEMENT_SCOPE` — for ARM API calls (`https://management.azure.com/.default offline_access`)
+- `DEFAULT_CLIENT_ID` — Microsoft's public client ID (works for most Entra tenants)
 
 ### Auth strategy (auth.rs)
 
@@ -665,3 +786,8 @@ others get `Bearer`. Use `with_auth()` for explicit control (e.g., Entra tokens)
 8. **Foundry URL stripping** — project path is stripped for chat because the
    resource-level endpoint handles deployment routing. Project path is kept
    for model listing where it provides project-scoped results.
+9. **App-defined @reference resolution** — agentive parses `@name` syntax but
+   delegates resolution to the app. What `@thing` means (file, DB record, API
+   response) is entirely app-specific.
+10. **Observability via events** — run_id, tool_call_id, elapsed_ms, and iteration
+    are embedded in RunnerEvent variants. No external tracing dependency required.
