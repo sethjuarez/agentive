@@ -20,7 +20,7 @@
 //!     provider,
 //!     vec![ChatMessage::system("You are helpful"), ChatMessage::user("Hi")],
 //!     vec![],
-//!     |_call| Ok("not implemented".into()),
+//!     |_call| async { Ok("not implemented".into()) },
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
 //!     Steering::new(),
@@ -33,6 +33,8 @@
 
 use std::sync::Arc;
 
+use futures_util::future::join_all;
+use futures_util::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::cancel::CancellationToken;
@@ -45,7 +47,6 @@ use crate::steering::Steering;
 use crate::types::*;
 
 /// Configuration for the runner.
-#[derive(Debug, Clone)]
 pub struct RunnerConfig {
     /// Maximum number of tool-call rounds before giving up.
     pub max_iterations: usize,
@@ -59,6 +60,46 @@ pub struct RunnerConfig {
     pub parallel_tool_calls: bool,
     /// Optional structured output format (JSON mode or JSON schema).
     pub response_format: Option<ResponseFormat>,
+    /// Optional provider for LLM-powered context compaction.
+    /// When set and context is trimmed, the runner calls this provider to produce
+    /// a richer summary of dropped messages (instead of string-based extraction).
+    pub compaction_provider: Option<Arc<dyn Provider>>,
+    /// Optional per-round tool filter. When set, called each iteration with the
+    /// current message history to determine which tools to offer the LLM.
+    /// Use this for progressive disclosure, agent-specific tool sets, or
+    /// conditional tool availability.
+    /// When `None`, the static `tools` vec passed to `run()` is used every round.
+    pub tool_filter: Option<Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>>,
+}
+
+impl Clone for RunnerConfig {
+    fn clone(&self) -> Self {
+        Self {
+            max_iterations: self.max_iterations,
+            retry_on_400: self.retry_on_400,
+            auto_trim_context: self.auto_trim_context,
+            sanitize_tool_results: self.sanitize_tool_results,
+            parallel_tool_calls: self.parallel_tool_calls,
+            response_format: self.response_format.clone(),
+            compaction_provider: self.compaction_provider.clone(),
+            tool_filter: self.tool_filter.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RunnerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerConfig")
+            .field("max_iterations", &self.max_iterations)
+            .field("retry_on_400", &self.retry_on_400)
+            .field("auto_trim_context", &self.auto_trim_context)
+            .field("sanitize_tool_results", &self.sanitize_tool_results)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("response_format", &self.response_format)
+            .field("compaction_provider", &self.compaction_provider.is_some())
+            .field("tool_filter", &self.tool_filter.is_some())
+            .finish()
+    }
 }
 
 impl Default for RunnerConfig {
@@ -70,6 +111,8 @@ impl Default for RunnerConfig {
             sanitize_tool_results: true,
             parallel_tool_calls: true,
             response_format: None,
+            compaction_provider: None,
+            tool_filter: None,
         }
     }
 }
@@ -127,7 +170,7 @@ pub struct RunnerResult {
 /// * `steering` - Handle for injecting user messages mid-run (see [`Steering`]).
 /// * `guardrails` - Optional validation hooks (see [`Guardrails`]).
 /// * `on_event` - Callback for runner events (streaming tokens, status, etc.).
-pub async fn run<F, E>(
+pub async fn run<F, Fut, E>(
     provider: Arc<dyn Provider>,
     messages: Vec<ChatMessage>,
     tools: Vec<Tool>,
@@ -139,7 +182,8 @@ pub async fn run<F, E>(
     on_event: E,
 ) -> Result<RunnerResult, AgentError>
 where
-    F: Fn(&ToolCall) -> Result<String, String> + Send + Sync,
+    F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
     let mut full_messages = messages;
@@ -168,7 +212,7 @@ where
         // Trim context if needed
         if config.auto_trim_context {
             let budget = provider.context_budget_chars();
-            let (dropped_count, _dropped) = trim_to_context_window(&mut full_messages, budget);
+            let (dropped_count, dropped) = trim_to_context_window(&mut full_messages, budget);
             if dropped_count > 0 {
                 on_event(RunnerEvent::Status {
                     message: format!(
@@ -176,6 +220,30 @@ where
                         dropped_count
                     ),
                 });
+
+                // Upgrade to LLM-powered summary if compaction provider is available
+                if let Some(ref compaction_provider) = config.compaction_provider {
+                    on_event(RunnerEvent::Status {
+                        message: "Generating AI summary of earlier conversation…".into(),
+                    });
+                    let llm_summary = crate::context::summarize_dropped_with_llm(
+                        &dropped, compaction_provider, &cancel,
+                    ).await;
+                    // Replace the string-based summary with the LLM one
+                    // The summary is the first non-system user message
+                    if !llm_summary.is_empty() {
+                        let system_end = full_messages
+                            .iter()
+                            .position(|m| m.role != "system")
+                            .unwrap_or(0);
+                        if system_end < full_messages.len()
+                            && full_messages[system_end].role == "user"
+                            && full_messages[system_end].text().map_or(false, |t| t.starts_with("[Earlier conversation summary"))
+                        {
+                            full_messages[system_end] = ChatMessage::user(&llm_summary);
+                        }
+                    }
+                }
             }
         }
 
@@ -184,14 +252,21 @@ where
             return Err(AgentError::Guardrailed(reason));
         }
 
+        // Determine tools for this round (static or dynamic)
+        let round_tools = if let Some(ref filter) = config.tool_filter {
+            filter(&full_messages)
+        } else {
+            tools.clone()
+        };
+
         // Build request
         let request = ChatRequest {
             messages: full_messages.clone(),
             model: String::new(), // Provider uses its own model
-            tools: if tools.is_empty() {
+            tools: if round_tools.is_empty() {
                 None
             } else {
-                Some(tools.clone())
+                Some(round_tools.clone())
             },
             stream: true,
             response_format: config.response_format.clone(),
@@ -253,10 +328,10 @@ where
                     let request2 = ChatRequest {
                         messages: full_messages.clone(),
                         model: String::new(),
-                        tools: if tools.is_empty() {
+                        tools: if round_tools.is_empty() {
                             None
                         } else {
-                            Some(tools.clone())
+                            Some(round_tools.clone())
                         },
                         stream: true,
                         response_format: config.response_format.clone(),
@@ -333,7 +408,7 @@ where
 
         // Check for tool calls
         if let Some(ref tool_calls) = response.message.tool_calls {
-            if !tool_calls.is_empty() && !tools.is_empty() {
+            if !tool_calls.is_empty() && !round_tools.is_empty() {
                 // Add assistant message with tool calls to history
                 full_messages.push(response.message.clone());
                 new_messages.push(response.message.clone());
@@ -344,9 +419,9 @@ where
 
                 // Execute tool calls (parallel or sequential)
                 let tool_results = if config.parallel_tool_calls && tool_calls.len() > 1 {
-                    execute_tools_parallel(tool_calls, &tool_executor, &config, &guardrails, &on_event)?
+                    execute_tools_parallel(tool_calls, &tool_executor, &config, &guardrails, &on_event).await?
                 } else {
-                    execute_tools_sequential(tool_calls, &tool_executor, &config, &guardrails, &on_event)?
+                    execute_tools_sequential(tool_calls, &tool_executor, &config, &guardrails, &on_event).await?
                 };
 
                 for tool_msg in &tool_results {
@@ -390,7 +465,7 @@ where
 }
 
 /// Execute tool calls sequentially with panic safety and guardrails.
-fn execute_tools_sequential<F, E>(
+async fn execute_tools_sequential<F, Fut, E>(
     tool_calls: &[ToolCall],
     tool_executor: &F,
     config: &RunnerConfig,
@@ -398,7 +473,8 @@ fn execute_tools_sequential<F, E>(
     on_event: &E,
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
-    F: Fn(&ToolCall) -> Result<String, String> + Send + Sync,
+    F: Fn(ToolCall) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
     let mut results = Vec::with_capacity(tool_calls.len());
@@ -414,23 +490,23 @@ where
             continue;
         }
 
-        let raw_result = execute_tool_safe(tc, tool_executor)?;
+        let (id, name, raw_result) = execute_tool_safe(tc.clone(), tool_executor).await?;
         let clean = if config.sanitize_tool_results {
             sanitize_for_api(&raw_result)
         } else {
             raw_result
         };
         on_event(RunnerEvent::ToolResult {
-            name: tc.function.name.clone(),
+            name,
             result: clean.clone(),
         });
-        results.push(ChatMessage::tool_result(&tc.id, &clean));
+        results.push(ChatMessage::tool_result(&id, &clean));
     }
     Ok(results)
 }
 
 /// Execute tool calls in parallel with panic safety and guardrails.
-fn execute_tools_parallel<F, E>(
+async fn execute_tools_parallel<F, Fut, E>(
     tool_calls: &[ToolCall],
     tool_executor: &F,
     config: &RunnerConfig,
@@ -438,39 +514,26 @@ fn execute_tools_parallel<F, E>(
     on_event: &E,
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
-    F: Fn(&ToolCall) -> Result<String, String> + Send + Sync,
+    F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
-    // Use std threads for parallel execution since tool_executor is Fn (sync)
-    let results: Vec<Result<(String, String, String), AgentError>> = std::thread::scope(|s| {
-        let handles: Vec<_> = tool_calls
-            .iter()
-            .map(|tc| {
-                let name = tc.function.name.clone();
-                let id = tc.id.clone();
+    let futures: Vec<_> = tool_calls.iter().map(|tc| {
+        let tc_clone = tc.clone();
+        let denied = match guardrails.check_tool(tc) {
+            GuardrailResult::Deny(reason) => Some(reason),
+            GuardrailResult::Allow => None,
+        };
+        async move {
+            if let Some(reason) = denied {
+                Ok((tc_clone.id.clone(), tc_clone.function.name.clone(), format!("Tool denied by guardrail: {}", reason)))
+            } else {
+                execute_tool_safe(tc_clone, tool_executor).await
+            }
+        }
+    }).collect();
 
-                // Tool guardrail check (runs in main thread before spawning)
-                let denied = match guardrails.check_tool(tc) {
-                    GuardrailResult::Deny(reason) => Some(reason),
-                    GuardrailResult::Allow => None,
-                };
-
-                s.spawn(move || {
-                    if let Some(reason) = denied {
-                        Ok((id, name, format!("Tool denied by guardrail: {}", reason)))
-                    } else {
-                        let raw = execute_tool_safe(tc, tool_executor)?;
-                        Ok((id, name, raw))
-                    }
-                })
-            })
-            .collect();
-
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(AgentError::Stream("Thread panicked".into()))))
-            .collect()
-    });
+    let results = join_all(futures).await;
 
     let mut messages = Vec::with_capacity(tool_calls.len());
     for res in results {
@@ -489,16 +552,22 @@ where
     Ok(messages)
 }
 
-/// Execute a single tool call with panic safety via `catch_unwind`.
-fn execute_tool_safe<F>(tc: &ToolCall, tool_executor: &F) -> Result<String, AgentError>
+/// Execute a single tool call with panic safety via `catch_unwind` on the async future.
+async fn execute_tool_safe<F, Fut>(tc: ToolCall, tool_executor: &F) -> Result<(String, String, String), AgentError>
 where
-    F: Fn(&ToolCall) -> Result<String, String>,
+    F: Fn(ToolCall) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String, String>> + Send,
 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tool_executor(tc)));
+    let name = tc.function.name.clone();
+    let id = tc.id.clone();
+
+    let result = std::panic::AssertUnwindSafe(tool_executor(tc))
+        .catch_unwind()
+        .await;
 
     match result {
-        Ok(Ok(r)) => Ok(r),
-        Ok(Err(e)) => Ok(format!("Tool error: {}", e)),
+        Ok(Ok(r)) => Ok((id, name, r)),
+        Ok(Err(e)) => Ok((id, name, format!("Tool error: {}", e))),
         Err(panic_info) => {
             let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                 s.to_string()
@@ -508,7 +577,7 @@ where
                 "unknown panic".to_string()
             };
             Err(AgentError::ToolPanic {
-                name: tc.function.name.clone(),
+                name,
                 message: panic_msg,
             })
         }
@@ -573,6 +642,41 @@ mod tests {
         }
     }
 
+    /// MockProvider variant with a small context budget (triggers compaction).
+    struct SmallBudgetMockProvider {
+        inner: MockProvider,
+        budget: usize,
+    }
+
+    impl SmallBudgetMockProvider {
+        fn new(responses: Vec<ChatResponse>, budget: usize) -> Self {
+            Self {
+                inner: MockProvider::new(responses),
+                budget,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for SmallBudgetMockProvider {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            self.inner.chat(request, tx, cancel).await
+        }
+
+        fn name(&self) -> &str {
+            "small_budget_mock"
+        }
+
+        fn context_budget_chars(&self) -> usize {
+            self.budget
+        }
+    }
+
     #[tokio::test]
     async fn test_simple_conversation() {
         let provider = Arc::new(MockProvider::new(vec![ChatResponse {
@@ -587,8 +691,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("unused".into()),
-            RunnerConfig::default(),
+            |_| async { Ok("unused".into()) },            RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
             Guardrails::default(),
@@ -636,7 +739,7 @@ mod tests {
                 "Read a file",
                 serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             )],
-            |call| {
+            |call| async move {
                 assert_eq!(call.function.name, "read_file");
                 Ok("hello world".into())
             },
@@ -668,7 +771,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             cancel,
             Steering::new(),
@@ -704,7 +807,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("loop forever")],
             vec![Tool::function("loop_tool", "loops", serde_json::json!({}))],
-            |_| Ok("looping".into()),
+            |_| async { Ok("looping".into()) },
             RunnerConfig {
                 max_iterations: 3,
                 ..Default::default()
@@ -750,7 +853,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Do the thing")],
             vec![Tool::function("slow_tool", "a tool", serde_json::json!({}))],
-            |_| Ok("tool result".into()),
+            |_| async { Ok("tool result".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             steering,
@@ -801,7 +904,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("go")],
             vec![Tool::function("tool1", "a tool", serde_json::json!({}))],
-            |_| Ok("ok".into()),
+            |_| async { Ok("ok".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -868,8 +971,11 @@ mod tests {
                 Tool::function("tool_c", "c", serde_json::json!({})),
             ],
             move |tc| {
-                count_clone.fetch_add(1, Ordering::SeqCst);
-                Ok(format!("result from {}", tc.function.name))
+                let cc = count_clone.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok(format!("result from {}", tc.function.name))
+                }
             },
             RunnerConfig {
                 parallel_tool_calls: true,
@@ -918,7 +1024,7 @@ mod tests {
                 "panics",
                 serde_json::json!({}),
             )],
-            |_| panic!("tool went boom"),
+            |_| async { panic!("tool went boom") },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -951,7 +1057,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hello")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1013,7 +1119,7 @@ mod tests {
                 Tool::function("safe_tool", "safe", serde_json::json!({})),
                 Tool::function("dangerous_tool", "dangerous", serde_json::json!({})),
             ],
-            |_| Ok("safe result".into()),
+            |_| async { Ok("safe result".into()) },
             RunnerConfig {
                 parallel_tool_calls: false, // sequential so we can test order
                 ..Default::default()
@@ -1057,7 +1163,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("give me the key")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1256,7 +1362,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1282,7 +1388,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig {
                 retry_on_400: true,
                 ..Default::default()
@@ -1306,7 +1412,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig {
                 retry_on_400: true,
                 ..Default::default()
@@ -1335,7 +1441,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig {
                 retry_on_400: false,
                 ..Default::default()
@@ -1361,7 +1467,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1386,7 +1492,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1420,7 +1526,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| Ok("".into()),
+            |_| async { Ok("".into()) },
             RunnerConfig::default(),
             cancel,
             Steering::new(),
@@ -1460,7 +1566,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("go")],
             vec![Tool::function("failing_tool", "fails", serde_json::json!({}))],
-            |_| Err("Something went wrong".into()),
+            |_| async { Err("Something went wrong".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1530,7 +1636,7 @@ mod tests {
                 Tool::function("allowed_tool", "ok", serde_json::json!({})),
                 Tool::function("blocked_tool", "nope", serde_json::json!({})),
             ],
-            |_| Ok("tool succeeded".into()),
+            |_| async { Ok("tool succeeded".into()) },
             RunnerConfig {
                 parallel_tool_calls: true,
                 ..Default::default()
@@ -1588,7 +1694,7 @@ mod tests {
                 Tool::function("good_tool", "good", serde_json::json!({})),
                 Tool::function("bad_tool", "panics", serde_json::json!({})),
             ],
-            |tc| {
+            |tc| async move {
                 if tc.function.name == "bad_tool" {
                     panic!("parallel panic test");
                 }
@@ -1612,5 +1718,512 @@ mod tests {
             }
             other => panic!("Expected ToolPanic, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_tool_gating() {
+        // Provider returns tool calls, but the tool filter removes the tool
+        // on the second round, so the model should produce text instead
+        let provider = Arc::new(MockProvider::new(vec![
+            // First response: call tool_a (which is available)
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "tool_a".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            // Second response: final text (tool_a is no longer offered)
+            ChatResponse {
+                message: ChatMessage::assistant("Done after gating"),
+                usage: None,
+            },
+        ]));
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = call_count.clone();
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("go")],
+            vec![Tool::function("tool_a", "a tool", serde_json::json!({}))],
+            move |_tc| {
+                let cc = count_clone.clone();
+                async move {
+                    cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("tool result".into())
+                }
+            },
+            RunnerConfig {
+                // After first tool call, remove all tools
+                tool_filter: Some(Arc::new(|msgs| {
+                    let has_tool_result = msgs.iter().any(|m| m.role == "tool");
+                    if has_tool_result {
+                        vec![] // No more tools after first round
+                    } else {
+                        vec![Tool::function("tool_a", "a tool", serde_json::json!({}))]
+                    }
+                })),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Done after gating");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_truly_async_tool_executor() {
+        // Verify that async tool executors actually run asynchronously
+        // (not just sync closures wrapped in async {})
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "slow_tool".into(),
+                            arguments: r#"{"id":"1"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "slow_tool".into(),
+                            arguments: r#"{"id":"2"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "slow_tool".into(),
+                            arguments: r#"{"id":"3"}"#.into(),
+                        },
+                    },
+                ]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("All done"),
+                usage: None,
+            },
+        ]));
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = call_count.clone();
+
+        let start = Instant::now();
+        let result = run(
+            provider,
+            vec![ChatMessage::user("run slow tools")],
+            vec![Tool::function("slow_tool", "slow", serde_json::json!({}))],
+            move |_tc| {
+                let cc = count_clone.clone();
+                async move {
+                    // Simulate async I/O (like a network request)
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok("async result".into())
+                }
+            },
+            RunnerConfig {
+                parallel_tool_calls: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let elapsed = start.elapsed();
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(result.response, "All done");
+        // If truly parallel, 3x50ms should complete in ~50-100ms, not 150ms+
+        assert!(
+            elapsed.as_millis() < 200,
+            "Expected parallel execution (<200ms), got {}ms — tools ran sequentially",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_sequential_tools_run_in_order() {
+        // Verify sequential mode preserves order even with async executors
+
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "tool_a".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "tool_b".into(),
+                            arguments: "{}".into(),
+                        },
+                    },
+                ]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("Done in order"),
+                usage: None,
+            },
+        ]));
+
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let order_clone = order.clone();
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("go")],
+            vec![
+                Tool::function("tool_a", "a", serde_json::json!({})),
+                Tool::function("tool_b", "b", serde_json::json!({})),
+            ],
+            move |tc| {
+                let oc = order_clone.clone();
+                async move {
+                    // Small delay to make ordering visible
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    oc.lock().unwrap().push(tc.function.name.clone());
+                    Ok(format!("result from {}", tc.function.name))
+                }
+            },
+            RunnerConfig {
+                parallel_tool_calls: false, // sequential!
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Done in order");
+        let execution_order = order.lock().unwrap().clone();
+        assert_eq!(execution_order, vec!["tool_a", "tool_b"]);
+    }
+
+    #[tokio::test]
+    async fn test_compaction_with_mock_llm() {
+        // Test that LLM compaction replaces the string-based summary
+        // when a compaction_provider is set and the context exceeds budget
+
+        // Create a compaction provider that returns a specific summary
+        struct CompactionProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for CompactionProvider {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                tx: mpsc::Sender<ChatEvent>,
+                _cancel: &CancellationToken,
+            ) -> Result<(), AgentError> {
+                let _ = tx.send(ChatEvent::Done {
+                    response: ChatResponse {
+                        message: ChatMessage::assistant(
+                            "User discussed Rust memory safety. Assistant explained ownership and borrowing."
+                        ),
+                        usage: None,
+                    },
+                }).await;
+                Ok(())
+            }
+
+            fn name(&self) -> &str { "compaction_mock" }
+        }
+
+        // Create a main provider with a small context budget to trigger compaction
+        let main_provider = Arc::new(SmallBudgetMockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant("Continuing from where we left off"),
+                usage: None,
+            },
+        ], 10_000));
+
+        // Build a large message history that will trigger compaction
+        let mut messages = vec![ChatMessage::system("You are helpful")];
+        for i in 0..100 {
+            messages.push(ChatMessage::user(&format!("Long question {}: {}", i, "x".repeat(500))));
+            messages.push(ChatMessage::assistant(&format!("Long answer {}: {}", i, "y".repeat(500))));
+        }
+        messages.push(ChatMessage::user("Final question"));
+
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let events_clone = events.clone();
+
+        let result = run(
+            main_provider,
+            messages,
+            vec![],
+            |_| async { Ok("unused".into()) },
+            RunnerConfig {
+                auto_trim_context: true,
+                compaction_provider: Some(Arc::new(CompactionProvider)),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            move |event| {
+                if let RunnerEvent::Status { message } = &event {
+                    events_clone.lock().unwrap().push(message.clone());
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Continuing from where we left off");
+
+        // Check that compaction status events were emitted
+        let status_msgs = events.lock().unwrap().clone();
+        assert!(
+            status_msgs.iter().any(|s| s.contains("Compacted context")),
+            "Should emit compaction status. Got: {:?}",
+            status_msgs
+        );
+        assert!(
+            status_msgs.iter().any(|s| s.contains("AI summary")),
+            "Should emit LLM summary status. Got: {:?}",
+            status_msgs
+        );
+
+        // Verify the LLM summary was inserted into the message history
+        let summary_msg = result.messages.iter().find(|m| {
+            m.role == "user"
+                && m.text().map_or(false, |t| t.contains("ownership and borrowing"))
+        });
+        assert!(
+            summary_msg.is_some(),
+            "LLM summary should be in the conversation history. Messages: {:?}",
+            result.messages.iter().map(|m| format!("{}: {}", m.role, m.text().unwrap_or("(none)")
+                .chars().take(80).collect::<String>()
+            )).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_fallback_on_error() {
+        // When the compaction provider fails, the string-based summary should remain
+
+        struct FailingCompactionProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for FailingCompactionProvider {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                tx: mpsc::Sender<ChatEvent>,
+                _cancel: &CancellationToken,
+            ) -> Result<(), AgentError> {
+                let _ = tx.send(ChatEvent::Error {
+                    message: "API rate limit exceeded".into(),
+                }).await;
+                Err(AgentError::Api { status: 429, message: "Rate limited".into() })
+            }
+
+            fn name(&self) -> &str { "failing_compaction" }
+        }
+
+        let main_provider = Arc::new(SmallBudgetMockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant("Handled it"),
+                usage: None,
+            },
+        ], 10_000));
+
+        // Large history to trigger compaction
+        let mut messages = vec![ChatMessage::system("System prompt")];
+        for i in 0..100 {
+            messages.push(ChatMessage::user(&format!("Question {}: {}", i, "x".repeat(500))));
+            messages.push(ChatMessage::assistant(&format!("Answer {}: {}", i, "y".repeat(500))));
+        }
+        messages.push(ChatMessage::user("Latest question"));
+
+        let result = run(
+            main_provider,
+            messages,
+            vec![],
+            |_| async { Ok("unused".into()) },
+            RunnerConfig {
+                auto_trim_context: true,
+                compaction_provider: Some(Arc::new(FailingCompactionProvider)),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Handled it");
+
+        // The string-based summary should still be present (fallback)
+        let has_summary = result.messages.iter().any(|m| {
+            m.role == "user"
+                && m.text().map_or(false, |t| t.starts_with("[Earlier conversation summary]"))
+        });
+        assert!(
+            has_summary,
+            "String-based summary should remain as fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_preserves_system_messages() {
+        // Verify that context compaction never drops system messages
+
+        let main_provider = Arc::new(SmallBudgetMockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant("Responded after compaction"),
+                usage: None,
+            },
+        ], 10_000));
+
+        let system_prompt = "You are a specialized Rust tutor.";
+        let mut messages = vec![ChatMessage::system(system_prompt)];
+        for i in 0..100 {
+            messages.push(ChatMessage::user(&format!("Q{}: {}", i, "x".repeat(500))));
+            messages.push(ChatMessage::assistant(&format!("A{}: {}", i, "y".repeat(500))));
+        }
+        messages.push(ChatMessage::user("Final"));
+
+        let result = run(
+            main_provider,
+            messages,
+            vec![],
+            |_| async { Ok("unused".into()) },
+            RunnerConfig {
+                auto_trim_context: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // System message must be first
+        assert_eq!(result.messages[0].role, "system");
+        assert_eq!(result.messages[0].text().unwrap(), system_prompt);
+    }
+
+    #[tokio::test]
+    async fn test_tool_filter_changes_between_rounds() {
+        // Verify that tool_filter is called fresh each round and can change
+        // the available tool set dynamically based on conversation state
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let provider = Arc::new(MockProvider::new(vec![
+            // Round 1: calls read_file (available)
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            // Round 2: calls write_file (now available because we read first)
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "c2".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "write_file".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            // Round 3: done
+            ChatResponse {
+                message: ChatMessage::assistant("Read and wrote successfully"),
+                usage: None,
+            },
+        ]));
+
+        let cc = call_count.clone();
+
+        // Filter: first round only read_file, after a read_file result, also offer write_file
+        let filter_call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fcc = filter_call_count.clone();
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("read then write")],
+            vec![], // static tools unused when filter is set
+            move |tc| {
+                let cc2 = cc.clone();
+                async move {
+                    cc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(format!("result from {}", tc.function.name))
+                }
+            },
+            RunnerConfig {
+                tool_filter: Some(Arc::new(move |msgs| {
+                    fcc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let has_read_result = msgs.iter().any(|m| {
+                        m.role == "tool" && m.text().map_or(false, |t| t.contains("result from read_file"))
+                    });
+                    let mut tools = vec![Tool::function("read_file", "reads", serde_json::json!({}))];
+                    if has_read_result {
+                        tools.push(Tool::function("write_file", "writes", serde_json::json!({})));
+                    }
+                    tools
+                })),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "Read and wrote successfully");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Filter should have been called 3 times (once per round)
+        assert_eq!(filter_call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

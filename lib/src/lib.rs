@@ -19,7 +19,7 @@
 //!     provider,
 //!     vec![ChatMessage::user("Hello!")],
 //!     vec![],
-//!     |_call| Ok("tool not implemented".into()),
+//!     |_call| async { Ok("tool not implemented".into()) },
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
 //!     Steering::new(),
@@ -37,6 +37,7 @@ pub mod cancel;
 pub mod context;
 pub mod discovery;
 pub mod error;
+pub mod factory;
 pub mod guardrails;
 pub mod parse;
 pub mod provider;
@@ -49,6 +50,7 @@ pub mod types;
 pub use auth::AuthStrategy;
 pub use cancel::CancellationToken;
 pub use error::AgentError;
+pub use factory::{build_provider, build_provider_with_auth, needs_responses_api};
 pub use guardrails::{GuardrailResult, Guardrails};
 pub use parse::parse_tool_args;
 pub use provider::Provider;

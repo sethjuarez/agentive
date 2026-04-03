@@ -19,6 +19,7 @@ lib/src/
 ├── error.rs                # AgentError enum
 ├── cancel.rs               # CancellationToken (Arc<AtomicBool> wrapper)
 ├── provider.rs             # Provider trait definition
+├── factory.rs              # Provider factory — auto-routing from model name
 ├── steering.rs             # Steering — inject user messages mid-run
 ├── parse.rs                # Robust JSON argument parsing for LLM output
 ├── guardrails.rs           # Input/output/tool guardrails (validation hooks)
@@ -111,17 +112,20 @@ AgentError::MaxIterations(usize)     // exceeded tool loop limit
 This is the main entry point. It runs the agentic loop:
 
 ```rust
-pub async fn run<F, E>(
+pub async fn run<F, Fut, E>(
     provider: Arc<dyn Provider>,     // LLM provider
     messages: Vec<ChatMessage>,      // initial conversation (include system prompt)
     tools: Vec<Tool>,                // tool definitions for the LLM
-    tool_executor: F,                // closure: &ToolCall -> Result<String, String>
-    config: RunnerConfig,            // max_iterations, retry, trimming, sanitization
+    tool_executor: F,                // async closure: ToolCall -> Result<String, String>
+    config: RunnerConfig,            // max_iterations, retry, trimming, sanitization, compaction
     cancel: CancellationToken,       // for user-initiated stop
     steering: Steering,              // inject user messages mid-loop
     guardrails: Guardrails,          // input/output/tool validation hooks
     on_event: E,                     // callback for RunnerEvent
 ) -> Result<RunnerResult, AgentError>
+where
+    F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, String>> + Send,
 ```
 
 ### RunnerConfig defaults
@@ -131,6 +135,8 @@ pub async fn run<F, E>(
 - `sanitize_tool_results: true` — strip control chars and base64
 - `parallel_tool_calls: true` — execute multiple tool calls concurrently
 - `response_format: None` — optional structured output (JSON mode or JSON schema)
+- `compaction_provider: None` — optional LLM provider for richer context compaction
+- `tool_filter: None` — optional per-round tool filter for dynamic tool gating
 
 ### RunnerResult
 - `messages: Vec<ChatMessage>` — full conversation history
@@ -200,6 +206,36 @@ Key differences from Chat Completions:
   `response.function_call_arguments.delta`, `response.completed`
 - Tool defs are flattened (no `function` wrapper)
 
+## Provider factory (factory.rs)
+
+Auto-routing from endpoint + model name to the right provider:
+
+```rust
+use agentive::factory::{build_provider, build_provider_with_auth};
+use agentive::AuthStrategy;
+
+// Simple: auto-detects provider type, auth, vision, context budget
+let provider = build_provider("https://api.openai.com/v1", "sk-...", "gpt-4o");
+
+// With explicit auth (e.g., Entra tokens for Azure)
+let provider = build_provider_with_auth(
+    "https://my-resource.openai.azure.com",
+    AuthStrategy::Dynamic(Arc::new(|| get_fresh_token())),
+    "gpt-5.1-codex",
+);
+```
+
+Auto-detection rules:
+- **Provider type**: `ResponsesProvider` for codex/pro models, `OpenAiProvider` for everything else
+- **Auth**: Azure endpoints (`azure.com`) use `api-key` header, others use `Bearer`
+- **Vision**: Enabled for gpt-4o, gpt-4.1, gpt-5, claude-3.5/4, o-series, gemini
+- **Context budget**: Model family heuristics (128k tokens for gpt-4o/5, 200k for Claude, etc.)
+
+Helper functions:
+- `needs_responses_api(model)` — check if model needs Responses API
+- `supports_vision(model)` — check if model supports image inputs
+- `default_context_budget(model)` — estimate context budget in characters
+
 ## Context trimming (context.rs)
 
 When conversations exceed the provider's `context_budget_chars()`:
@@ -208,9 +244,30 @@ When conversations exceed the provider's `context_budget_chars()`:
 3. Dropped messages are summarized into a compact user message
 4. Summary is inserted after system messages, before recent conversation
 
-The summary is string-based (no LLM call) — extracts user requests, assistant
-decisions, and tool call names. Apps can upgrade to LLM-powered summarization
-by handling `RunnerEvent::MessagesUpdated` and replacing the summary.
+The default summary is string-based (no LLM call) — extracts user requests,
+assistant decisions, and tool call names.
+
+### LLM-powered context compaction
+
+Set `RunnerConfig::compaction_provider` to upgrade the string summary with an
+LLM-generated one. When a compaction provider is configured and context is
+trimmed, the runner:
+
+1. First generates the fast string-based summary (as a fallback)
+2. Sends the summary to the compaction provider with a prompt to compress it
+3. Replaces the string summary with the LLM-generated one
+4. Falls back to the string summary if the LLM call fails
+
+```rust
+let config = RunnerConfig {
+    compaction_provider: Some(Arc::new(OpenAiProvider::new(
+        "https://api.openai.com/v1",
+        "sk-...",
+        "gpt-4o-mini", // cheap model for summarization
+    ))),
+    ..Default::default()
+};
+```
 
 ## Steering (steering.rs)
 
@@ -237,20 +294,49 @@ let result = run(provider, messages, tools, executor, config, cancel, steering, 
 
 ## Tool execution pattern
 
-Tools are app-specific. The runner accepts a closure:
+Tools are app-specific. The runner accepts an async closure that takes an
+owned `ToolCall` (not a reference, since async closures need owned data):
 ```rust
-|call: &ToolCall| -> Result<String, String> {
+|call: ToolCall| async move {
     let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
         .map_err(|e| e.to_string())?;
     match call.function.name.as_str() {
         "read_file" => {
             let path = args["path"].as_str().ok_or("missing path")?;
-            std::fs::read_to_string(path).map_err(|e| e.to_string())
+            tokio::fs::read_to_string(path).await.map_err(|e| e.to_string())
         }
         _ => Err(format!("Unknown tool: {}", call.function.name))
     }
 }
 ```
+
+## Dynamic tool gating
+
+Change which tools are available to the LLM each round:
+
+```rust
+use agentive::{RunnerConfig, Tool, ChatMessage};
+use std::sync::Arc;
+
+let config = RunnerConfig {
+    tool_filter: Some(Arc::new(|messages: &[ChatMessage]| {
+        let has_plan = messages.iter().any(|m| m.text().map_or(false, |t| t.contains("PLAN:")));
+        if has_plan {
+            // After planning, enable write tools
+            vec![
+                Tool::function("read_file", "Read a file", serde_json::json!({})),
+                Tool::function("write_file", "Write a file", serde_json::json!({})),
+            ]
+        } else {
+            // Before planning, only read tools
+            vec![Tool::function("read_file", "Read a file", serde_json::json!({}))]
+        }
+    })),
+    ..Default::default()
+};
+```
+
+When `tool_filter` is `None` (the default), the static `tools` vec passed to `run()` is used every round.
 
 ## Guardrails (guardrails.rs)
 
@@ -311,16 +397,17 @@ Strategies tried in order:
 ## Tool panic safety
 
 Tool closures are user code — if one panics, agentive catches it via
-`catch_unwind` and returns `AgentError::ToolPanic { name, message }`
-instead of crashing the whole runtime. No special handling needed from the
-consuming app; the error propagates normally from `run()`.
+`catch_unwind` on the async future (using `FutureExt::catch_unwind()`) and
+returns `AgentError::ToolPanic { name, message }` instead of crashing the
+whole runtime. No special handling needed from the consuming app; the error
+propagates normally from `run()`.
 
 ## Parallel tool execution
 
 When the LLM returns multiple tool calls in a single response and
 `RunnerConfig::parallel_tool_calls` is `true` (the default), tool calls
-execute concurrently using scoped threads. Set to `false` for sequential
-execution if your tools share mutable state.
+execute concurrently using `futures_util::future::join_all`. Set to `false`
+for sequential execution if your tools share mutable state.
 
 ## Structured output (types.rs)
 
@@ -509,7 +596,7 @@ others get `Bearer`. Use `with_auth()` for explicit control (e.g., Entra tokens)
 1. **mpsc channel for streaming** — provider writes events to a channel, runner
    reads concurrently. Avoids deadlocks from buffered streams.
 2. **Trait-based providers** — extensible; apps can implement custom providers.
-3. **Closure-based tool execution** — no trait to implement, just a function.
+3. **Async closure-based tool execution** — no trait to implement, just an async function.
 4. **Events-based persistence injection** — no ChatStore trait; apps persist
    via event callbacks however they want (or don't).
 5. **Multimodal from the start** — MessageContent supports text + image parts.

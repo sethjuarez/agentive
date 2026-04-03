@@ -135,6 +135,78 @@ pub fn trim_to_context_window(
     (dropped_count, dropped)
 }
 
+/// Summarize dropped messages using an LLM provider for richer context preservation.
+/// Falls back to string-based `summarize_dropped` if the LLM call fails.
+pub async fn summarize_dropped_with_llm(
+    dropped: &[ChatMessage],
+    provider: &std::sync::Arc<dyn crate::provider::Provider>,
+    cancel: &crate::cancel::CancellationToken,
+) -> String {
+    use crate::types::{ChatRequest, ChatEvent};
+    use tokio::sync::mpsc;
+
+    let fast_summary = summarize_dropped(dropped);
+    if fast_summary.is_empty() {
+        return fast_summary;
+    }
+
+    let prompt = format!(
+        "Compress the following conversation excerpt into a concise summary \
+         (max 500 words). Preserve key decisions, tool calls, and user requests. \
+         Output ONLY the summary, no preamble.\n\n{}",
+        fast_summary
+    );
+
+    let request = ChatRequest {
+        messages: vec![
+            ChatMessage::system("You are a conversation summarizer. Be concise and factual."),
+            ChatMessage::user(&prompt),
+        ],
+        model: String::new(),
+        tools: None,
+        stream: true,
+        response_format: None,
+    };
+
+    let (tx, mut rx) = mpsc::channel::<ChatEvent>(32);
+    let provider_clone = provider.clone();
+    let cancel_clone = cancel.clone();
+
+    let handle = tokio::spawn(async move {
+        provider_clone.chat(request, tx, &cancel_clone).await
+    });
+
+    let mut llm_summary = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            ChatEvent::Token { token } => llm_summary.push_str(&token),
+            ChatEvent::Done { response } => {
+                if let Some(text) = response.message.text() {
+                    if !text.is_empty() {
+                        llm_summary = text.to_string();
+                    }
+                }
+                break;
+            }
+            ChatEvent::Error { .. } => break,
+            _ => {}
+        }
+    }
+
+    // If the LLM task failed or returned empty, fall back to string summary
+    let task_result = handle
+        .await
+        .unwrap_or(Err(crate::error::AgentError::Stream("spawn failed".into())));
+    if task_result.is_err() || llm_summary.trim().is_empty() {
+        return fast_summary;
+    }
+
+    format!(
+        "[Earlier conversation summary]\n{}",
+        llm_summary.trim()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +318,202 @@ mod tests {
         let (dropped, _) = trim_to_context_window(&mut msgs, 100);
         assert_eq!(dropped, 0);
         assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_with_llm_success() {
+        use crate::cancel::CancellationToken;
+        use crate::error::AgentError;
+
+        struct SummaryProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for SummaryProvider {
+            async fn chat(
+                &self,
+                request: ChatRequest,
+                tx: tokio::sync::mpsc::Sender<crate::types::ChatEvent>,
+                _cancel: &CancellationToken,
+            ) -> Result<(), AgentError> {
+                // Verify the request has the right structure
+                assert_eq!(request.messages.len(), 2); // system + user
+                assert_eq!(request.messages[0].role, "system");
+                assert!(request.messages[1].text().unwrap().contains("User asked:"));
+
+                let _ = tx.send(crate::types::ChatEvent::Done {
+                    response: crate::types::ChatResponse {
+                        message: ChatMessage::assistant(
+                            "User asked about Rust safety. Assistant explained ownership."
+                        ),
+                        usage: None,
+                    },
+                }).await;
+                Ok(())
+            }
+
+            fn name(&self) -> &str { "summary_mock" }
+        }
+
+        let dropped = vec![
+            ChatMessage::user("Tell me about Rust memory safety"),
+            ChatMessage::assistant("Rust uses ownership and borrowing to ensure memory safety."),
+        ];
+
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(SummaryProvider);
+        let cancel = CancellationToken::new();
+
+        let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
+
+        assert!(result.starts_with("[Earlier conversation summary]"));
+        assert!(result.contains("ownership"));
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_with_llm_falls_back_on_error() {
+        use crate::cancel::CancellationToken;
+        use crate::error::AgentError;
+
+        struct ErrorProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for ErrorProvider {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                _tx: tokio::sync::mpsc::Sender<crate::types::ChatEvent>,
+                _cancel: &CancellationToken,
+            ) -> Result<(), AgentError> {
+                Err(AgentError::Api { status: 500, message: "Server error".into() })
+            }
+
+            fn name(&self) -> &str { "error_mock" }
+        }
+
+        let dropped = vec![
+            ChatMessage::user("What is Rust?"),
+            ChatMessage::assistant("A systems programming language."),
+        ];
+
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(ErrorProvider);
+        let cancel = CancellationToken::new();
+
+        let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
+
+        // Should fall back to string-based summary
+        assert!(result.starts_with("[Earlier conversation summary]"));
+        assert!(result.contains("User asked:"));
+        assert!(result.contains("What is Rust?"));
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_with_llm_falls_back_on_empty() {
+        use crate::cancel::CancellationToken;
+        use crate::error::AgentError;
+
+        struct EmptyProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for EmptyProvider {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                tx: tokio::sync::mpsc::Sender<crate::types::ChatEvent>,
+                _cancel: &CancellationToken,
+            ) -> Result<(), AgentError> {
+                // Return an empty response
+                let _ = tx.send(crate::types::ChatEvent::Done {
+                    response: crate::types::ChatResponse {
+                        message: ChatMessage::assistant(""),
+                        usage: None,
+                    },
+                }).await;
+                Ok(())
+            }
+
+            fn name(&self) -> &str { "empty_mock" }
+        }
+
+        let dropped = vec![
+            ChatMessage::user("Hello"),
+        ];
+
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(EmptyProvider);
+        let cancel = CancellationToken::new();
+
+        let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
+
+        // Should fall back to string-based summary because LLM returned empty
+        assert!(result.starts_with("[Earlier conversation summary]"));
+        assert!(result.contains("User asked: Hello"));
+    }
+
+    #[tokio::test]
+    async fn test_summarize_dropped_with_llm_cancellation() {
+        use crate::cancel::CancellationToken;
+        use crate::error::AgentError;
+
+        struct SlowProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for SlowProvider {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                _tx: tokio::sync::mpsc::Sender<crate::types::ChatEvent>,
+                cancel: &CancellationToken,
+            ) -> Result<(), AgentError> {
+                for _ in 0..100 {
+                    if cancel.is_cancelled() {
+                        return Err(AgentError::Cancelled);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+                Ok(())
+            }
+
+            fn name(&self) -> &str { "slow_mock" }
+        }
+
+        let dropped = vec![
+            ChatMessage::user("Something"),
+        ];
+
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(SlowProvider);
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // Pre-cancel
+
+        let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
+
+        // Should fall back because provider was cancelled
+        assert!(result.starts_with("[Earlier conversation summary]"));
+    }
+
+    #[tokio::test]
+    async fn test_summarize_empty_dropped_returns_empty() {
+        use crate::cancel::CancellationToken;
+
+        struct NeverCalledProvider;
+
+        #[async_trait::async_trait]
+        impl crate::provider::Provider for NeverCalledProvider {
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                _tx: tokio::sync::mpsc::Sender<crate::types::ChatEvent>,
+                _cancel: &CancellationToken,
+            ) -> Result<(), crate::error::AgentError> {
+                panic!("Should not be called for empty dropped messages");
+            }
+
+            fn name(&self) -> &str { "never_called" }
+        }
+
+        let dropped: Vec<ChatMessage> = vec![];
+
+        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(NeverCalledProvider);
+        let cancel = CancellationToken::new();
+
+        let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
+        assert!(result.is_empty());
     }
 }

@@ -48,7 +48,7 @@ async fn test_openai_simple_chat() {
             ChatMessage::user("What is 2 + 2?"),
         ],
         vec![],
-        |_| Ok("unused".into()),
+        |_| async { Ok("unused".into()) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -104,7 +104,7 @@ async fn test_openai_tool_calling() {
                 "required": ["a", "b"]
             }),
         )],
-        |tc| {
+        |tc| async move {
             let args: serde_json::Value =
                 parse_tool_args(&tc.function.arguments).unwrap_or_default();
             let a = args["a"].as_f64().unwrap_or(0.0);
@@ -145,7 +145,7 @@ async fn test_anthropic_simple_chat() {
             ChatMessage::user("What is the capital of France?"),
         ],
         vec![],
-        |_| Ok("unused".into()),
+        |_| async { Ok("unused".into()) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -192,7 +192,7 @@ async fn test_anthropic_tool_calling() {
                 "required": ["a", "b"]
             }),
         )],
-        |tc| {
+        |tc| async move {
             let args: serde_json::Value =
                 parse_tool_args(&tc.function.arguments).unwrap_or_default();
             let a = args["a"].as_f64().unwrap_or(0.0);
@@ -249,7 +249,7 @@ async fn test_azure_openai_chat() {
             ChatMessage::user("What color is the sky on a clear day?"),
         ],
         vec![],
-        |_| Ok("unused".into()),
+        |_| async { Ok("unused".into()) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -288,7 +288,7 @@ async fn test_direct_openai_simple_chat() {
             ChatMessage::user("What is 2 + 2?"),
         ],
         vec![],
-        |_| Ok("unused".into()),
+        |_| async { Ok("unused".into()) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -353,7 +353,7 @@ async fn test_direct_openai_tool_calling() {
                 "required": ["a", "b"]
             }),
         )],
-        |tc| {
+        |tc| async move {
             let args: serde_json::Value =
                 parse_tool_args(&tc.function.arguments).unwrap_or_default();
             let a = args["a"].as_f64().unwrap_or(0.0);
