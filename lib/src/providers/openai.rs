@@ -94,10 +94,10 @@ impl OpenAiProvider {
         if self.endpoint.contains("/chat/completions") {
             self.endpoint.clone()
         } else if self.endpoint.contains("/api/projects/") {
-            // Foundry project endpoints need the /openai prefix + api-version
+            // Foundry project: use deployment-based URL with GA api-version
             format!(
-                "{}/openai/chat/completions?api-version=2024-10-21",
-                self.endpoint
+                "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
+                self.endpoint, self.model
             )
         } else {
             format!("{}/chat/completions", self.endpoint)
@@ -328,7 +328,7 @@ mod tests {
         );
         assert_eq!(
             p.chat_url(),
-            "https://my-resource.services.ai.azure.com/api/projects/my-project/openai/chat/completions?api-version=2024-10-21"
+            "https://my-resource.services.ai.azure.com/api/projects/my-project/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
         );
     }
 
