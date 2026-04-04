@@ -25,6 +25,13 @@ use crate::types::*;
 /// Unlike [`super::openai::OpenAiProvider`] which uses `/chat/completions`,
 /// this provider uses the `/v1/responses` endpoint with its different
 /// input/output format and SSE event types.
+///
+/// **Important:** The Azure Responses API endpoint silently truncates request
+/// bodies at ~79KB, causing JSON parse errors. This provider defaults to a
+/// `max_request_bytes` of 64KB and will automatically drop oldest conversation
+/// items to stay under that limit. Override with
+/// [`with_max_request_bytes`](Self::with_max_request_bytes) if your endpoint
+/// supports larger payloads.
 pub struct ResponsesProvider {
     endpoint: String,
     auth: AuthStrategy,
@@ -32,7 +39,11 @@ pub struct ResponsesProvider {
     client: Client,
     context_budget: usize,
     vision: bool,
+    max_request_bytes: usize,
 }
+
+/// Default max request body size (64KB) — safely below the ~79KB Azure limit.
+const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 impl ResponsesProvider {
     /// Create a new Responses API provider.
@@ -54,6 +65,7 @@ impl ResponsesProvider {
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 
@@ -66,6 +78,7 @@ impl ResponsesProvider {
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 
@@ -78,6 +91,15 @@ impl ResponsesProvider {
     /// Enable vision/image support.
     pub fn with_vision(mut self, enabled: bool) -> Self {
         self.vision = enabled;
+        self
+    }
+
+    /// Set the maximum request body size in bytes.
+    ///
+    /// The Azure Responses API silently truncates at ~79KB. Default is 64KB.
+    /// Set to `usize::MAX` to disable the guard.
+    pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes;
         self
     }
 
@@ -194,6 +216,88 @@ impl ResponsesProvider {
             })
             .collect()
     }
+
+    /// Build the JSON request body, compacting input items if the serialized
+    /// size exceeds `max_request_bytes`. Drops oldest non-system items first,
+    /// keeping tool_call/function_call_output pairs together.
+    fn build_body_within_limit(
+        &self,
+        input: &mut Vec<serde_json::Value>,
+        tools_json: &Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, AgentError> {
+        let make_body = |input: &[serde_json::Value]| -> serde_json::Value {
+            let mut b = serde_json::json!({
+                "model": self.model,
+                "input": input,
+                "stream": true,
+            });
+            if let Some(ref tools) = tools_json {
+                b["tools"] = tools.clone();
+            }
+            b
+        };
+
+        let body = make_body(input);
+        let serialized = serde_json::to_string(&body)
+            .map_err(|e| AgentError::Stream(format!("Failed to serialize request: {e}")))?;
+
+        if serialized.len() <= self.max_request_bytes {
+            return Ok(body);
+        }
+
+        // Body too large — drop oldest non-system input items.
+        // Skip system/developer messages at the front.
+        let sys_end = input
+            .iter()
+            .position(|item| {
+                item.get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|r| r != "system" && r != "developer")
+                    .unwrap_or(true)
+            })
+            .unwrap_or(input.len());
+
+        let mut dropped = 0;
+        while input.len() > sys_end + 2 {
+            let trial = make_body(input);
+            let size = serde_json::to_string(&trial)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX);
+            if size <= self.max_request_bytes {
+                break;
+            }
+
+            // Remove the first conversation item (after system prefix)
+            let removed = input.remove(sys_end);
+            dropped += 1;
+
+            // If we removed a function_call item, also remove its matching
+            // function_call_output items to avoid orphaned tool results
+            if removed.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                if let Some(call_id) = removed.get("call_id").and_then(|c| c.as_str()) {
+                    while input.len() > sys_end
+                        && input[sys_end].get("type").and_then(|t| t.as_str())
+                            == Some("function_call_output")
+                        && input[sys_end].get("call_id").and_then(|c| c.as_str())
+                            == Some(call_id)
+                    {
+                        input.remove(sys_end);
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+
+        if dropped > 0 {
+            log::warn!(
+                "[agentive] Responses body exceeded {}KB — dropped {} input items to fit",
+                self.max_request_bytes / 1024,
+                dropped
+            );
+        }
+
+        Ok(make_body(input))
+    }
 }
 
 #[async_trait::async_trait]
@@ -204,19 +308,21 @@ impl Provider for ResponsesProvider {
         tx: mpsc::Sender<ChatEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        let input = self.messages_to_input(&request.messages);
+        let mut input = self.messages_to_input(&request.messages);
 
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "input": input,
-            "stream": true,
+        let tools_json = request.tools.as_ref().and_then(|tools| {
+            if tools.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!(self.tools_to_responses_format(tools)))
+            }
         });
 
-        if let Some(ref tools) = request.tools {
-            if !tools.is_empty() {
-                body["tools"] = serde_json::json!(self.tools_to_responses_format(tools));
-            }
-        }
+        // Build body and enforce byte limit.
+        // The Azure Responses API silently truncates at ~79KB — we compact
+        // by dropping oldest non-system input items until the serialized
+        // body fits. This uses the actual byte count, not character estimates.
+        let body = self.build_body_within_limit(&mut input, &tools_json)?;
 
         let mut req = self.client.post(self.responses_url()).json(&body);
         req = self.auth.apply(req);
@@ -565,5 +671,114 @@ mod tests {
         };
         let input = provider.messages_to_input(&[msg]);
         assert!(input.is_empty()); // None content user messages are skipped
+    }
+
+    #[test]
+    fn test_body_within_limit_no_compaction() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
+            .with_max_request_bytes(64 * 1024);
+
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+        let mut input = provider.messages_to_input(&messages);
+        let body = provider.build_body_within_limit(&mut input, &None).unwrap();
+
+        // Small body should pass through unchanged
+        assert_eq!(input.len(), 2);
+        assert!(body.get("input").unwrap().as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn test_body_exceeds_limit_compacts() {
+        // Use a very small limit to force compaction
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
+            .with_max_request_bytes(200);
+
+        let messages = vec![
+            ChatMessage::system("System prompt"),
+            ChatMessage::user(&"A".repeat(100)),
+            ChatMessage::user(&"B".repeat(100)),
+            ChatMessage::user("Last"),
+        ];
+        let mut input = provider.messages_to_input(&messages);
+        let original_len = input.len();
+
+        let body = provider.build_body_within_limit(&mut input, &None).unwrap();
+
+        // Should have dropped some items
+        let final_len = body.get("input").unwrap().as_array().unwrap().len();
+        assert!(final_len < original_len, "Expected compaction: {} < {}", final_len, original_len);
+        // System/developer message should be preserved
+        assert_eq!(
+            body["input"][0]["role"].as_str().unwrap(),
+            "developer"
+        );
+    }
+
+    #[test]
+    fn test_body_compaction_preserves_system_messages() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
+            .with_max_request_bytes(300);
+
+        let messages = vec![
+            ChatMessage::system("Important system prompt"),
+            ChatMessage::user(&"A".repeat(200)),
+            ChatMessage::user("Short"),
+        ];
+        let mut input = provider.messages_to_input(&messages);
+        let _ = provider.build_body_within_limit(&mut input, &None).unwrap();
+
+        // Developer (system) message should never be dropped
+        assert!(input[0].get("role").unwrap().as_str().unwrap() == "developer");
+    }
+
+    #[test]
+    fn test_body_compaction_drops_tool_pairs() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
+            .with_max_request_bytes(400);
+
+        // Build input items directly to simulate function_call + output pairs
+        let mut input = vec![
+            serde_json::json!({"role": "developer", "content": "sys"}),
+            serde_json::json!({"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}" }),
+            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "A".repeat(300)}),
+            serde_json::json!({"role": "user", "content": "ok"}),
+        ];
+
+        let _ = provider.build_body_within_limit(&mut input, &None).unwrap();
+
+        // The function_call + its output should be dropped together
+        // No orphaned function_call_output should remain
+        for item in &input {
+            if item.get("type").and_then(|t| t.as_str()) == Some("function_call_output") {
+                // If a function_call_output remains, its matching function_call must also remain
+                let call_id = item["call_id"].as_str().unwrap();
+                assert!(
+                    input.iter().any(|i| {
+                        i.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                            && i.get("call_id").and_then(|c| c.as_str()) == Some(call_id)
+                    }),
+                    "Orphaned function_call_output for call_id={call_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_max_request_bytes_disabled() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
+            .with_max_request_bytes(usize::MAX);
+
+        let messages = vec![
+            ChatMessage::system("System"),
+            ChatMessage::user(&"A".repeat(100_000)),
+        ];
+        let mut input = provider.messages_to_input(&messages);
+        let body = provider.build_body_within_limit(&mut input, &None).unwrap();
+
+        // With max disabled, no compaction should occur
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
     }
 }
