@@ -56,7 +56,20 @@ pub fn supports_vision(model: &str) -> bool {
 ///
 /// Uses model family heuristics to pick a default. Returns characters, not tokens.
 /// Assumes ~4 chars/token and uses ~75% of the model's context window.
+///
+/// If `reported_context` is `Some(n)`, uses that token count instead of heuristics.
 pub fn default_context_budget(model: &str) -> usize {
+    context_budget(model, None)
+}
+
+/// Like [`default_context_budget`], but accepts an optional API-reported context
+/// length that overrides the heuristic.
+pub fn context_budget(model: &str, reported_context: Option<usize>) -> usize {
+    if let Some(reported) = reported_context {
+        let usable = reported * 3 / 4;
+        return usable * 4;
+    }
+
     let m = model.to_lowercase();
 
     let token_limit: usize = if m.contains("codex") {
@@ -64,20 +77,34 @@ pub fn default_context_budget(model: &str) -> usize {
         16_000
     } else if m.contains("claude-3-5") || m.contains("claude-3.5") || m.contains("claude-4") {
         200_000
+    } else if m.contains("claude") {
+        100_000
     } else if m.contains("gpt-5")
         || m.contains("gpt-4o")
         || m.contains("gpt-4.1")
         || m.contains("gpt-4-turbo")
+        || m.contains("gpt-4-1106")
+        || m.contains("gpt-4-0125")
         || m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4")
         || m.contains("gemini")
     {
         128_000
+    } else if m.contains("deepseek") {
+        64_000
+    } else if m.contains("gpt-35-turbo-16k") || m.contains("gpt-3.5-turbo-16k") {
+        16_384
+    } else if m.contains("mistral-large") || m.contains("mistral-medium") {
+        32_000
+    } else if m.contains("phi-4") || m.contains("phi-3") {
+        16_000
     } else if m.contains("gpt-4") {
         8_192
-    } else if m.contains("gpt-3.5") {
-        16_384
+    } else if m.contains("gpt-35") || m.contains("gpt-3.5") {
+        4_096
+    } else if m.contains("mistral") {
+        8_000
     } else {
         // Conservative default
         32_000
@@ -188,6 +215,27 @@ mod tests {
 
         // Unknown model: conservative default
         assert_eq!(default_context_budget("random-model"), 96_000);
+
+        // New model families
+        assert_eq!(default_context_budget("deepseek-r1"), 192_000);
+        assert_eq!(default_context_budget("phi-4"), 48_000);
+        assert_eq!(default_context_budget("mistral-large"), 96_000);
+        assert_eq!(default_context_budget("mistral-7b"), 24_000);
+        assert_eq!(default_context_budget("claude-3-opus"), 300_000);
+        assert_eq!(default_context_budget("gpt-35-turbo"), 12_288);
+
+        // o-series
+        assert_eq!(default_context_budget("o1-preview"), 384_000);
+        assert_eq!(default_context_budget("o3-mini"), 384_000);
+    }
+
+    #[test]
+    fn test_context_budget_with_reported() {
+        // Reported context overrides heuristic
+        assert_eq!(context_budget("my-custom-deployment", None), 96_000);
+        assert_eq!(context_budget("my-custom-deployment", Some(200_000)), 600_000);
+        // Even for known models, reported takes precedence
+        assert_eq!(context_budget("gpt-4o", Some(32_000)), 96_000);
     }
 
     #[test]
