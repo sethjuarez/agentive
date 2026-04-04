@@ -15,12 +15,13 @@ consuming apps only need to define their tools and wire up their UI.
 ```text
 lib/src/
 ├── lib.rs                  # Re-exports all public API
-├── types.rs                # Core types: ChatMessage, ToolCall, Tool, ChatEvent, Usage, etc.
+├── types.rs                # Core types: ChatMessage, ToolCall, Tool, ToolOutput, ChatEvent, Usage, etc.
 ├── error.rs                # AgentError enum
 ├── cancel.rs               # CancellationToken (Arc<AtomicBool> wrapper)
 ├── auth.rs                 # AuthStrategy enum (ApiKey, Bearer, Dynamic)
+├── chat.rs                 # simple_chat() — one-shot non-streaming helper
 ├── provider.rs             # Provider trait definition
-├── factory.rs              # Provider factory — auto-routing from model name
+├── factory.rs              # Provider factory — auto-routing, model heuristics, context budgets
 ├── steering.rs             # Steering — inject user messages mid-run
 ├── parse.rs                # Robust JSON argument parsing for LLM output
 ├── guardrails.rs           # Input/output/tool guardrails (validation hooks)
@@ -100,6 +101,12 @@ struct ImageUrl {
     detail: Option<String>, // "low", "high", or "auto"
 }
 
+// ToolOutput — returned by tool executors (implements From<String>)
+enum ToolOutput {
+    Text(String),
+    WithImages { text: String, images: Vec<ContentPart> },
+}
+
 // ToolFunction — definition inside a Tool
 struct ToolFunction {
     name: String,
@@ -174,7 +181,7 @@ pub async fn run<F, Fut, E>(
     provider: Arc<dyn Provider>,     // LLM provider
     messages: Vec<ChatMessage>,      // initial conversation (include system prompt)
     tools: Vec<Tool>,                // tool definitions for the LLM
-    tool_executor: F,                // async closure: ToolCall -> Result<String, String>
+    tool_executor: F,                // async closure: ToolCall -> Result<ToolOutput, String>
     config: RunnerConfig,            // max_iterations, retry, trimming, sanitization, compaction
     cancel: CancellationToken,       // for user-initiated stop
     steering: Steering,              // inject user messages mid-loop
@@ -183,7 +190,7 @@ pub async fn run<F, Fut, E>(
 ) -> Result<RunnerResult, AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<String, String>> + Send,
+    Fut: Future<Output = Result<ToolOutput, String>> + Send,
 ```
 
 ### RunnerConfig defaults
@@ -279,6 +286,35 @@ Key differences from Chat Completions:
   pairs are dropped together to avoid orphaned tool results. Set
   `with_max_request_bytes(usize::MAX)` to disable.
 
+## One-shot chat: `simple_chat()`
+
+For quick LLM calls that don't need the agentic loop (no tools, no streaming,
+no retries), use `simple_chat`:
+
+```rust
+use agentive::{simple_chat, ChatMessage};
+use std::sync::Arc;
+
+let provider = agentive::build_provider(
+    "https://my-resource.openai.azure.com",
+    "my-api-key",
+    "gpt-4o",
+);
+
+let response = simple_chat(
+    provider,
+    vec![
+        ChatMessage::system("You are a concise assistant."),
+        ChatMessage::user("Summarize this text: ..."),
+    ],
+).await?;
+
+println!("{}", response.text().unwrap_or("no response"));
+```
+
+Returns `Result<ChatMessage, AgentError>`. Use cases: text reformatting, sparkle
+fills, summarization, classification — anything that's a single request/response.
+
 ## Provider factory (factory.rs)
 
 Auto-routing from endpoint + model name to the right provider:
@@ -305,9 +341,49 @@ Auto-detection rules:
 - **Context budget**: Model family heuristics (128k tokens for gpt-4o/5, 200k for Claude, etc.)
 
 Helper functions:
+
 - `needs_responses_api(model)` — check if model needs Responses API
 - `supports_vision(model)` — check if model supports image inputs
-- `default_context_budget(model)` — estimate context budget in characters
+- `default_context_budget(model)` — estimate context budget in characters from model name
+- `context_budget(model, reported_context)` — budget with optional API-reported context length override
+
+### Model families recognized
+
+| Family | Vision | Context | Notes |
+| --- | --- | --- | --- |
+| gpt-4o, gpt-4.1, gpt-5 | ✅ | 384K chars | 128K tokens × 75% × 4 chars |
+| gpt-4-turbo, gpt-4-1106, gpt-4-0125 | ✅ | 384K chars | 128K token variants |
+| gpt-35-turbo-16k, gpt-3.5-turbo-16k | ❌ | 49K chars | 16K tokens |
+| gpt-35-turbo, gpt-3.5-turbo | ❌ | 12K chars | 4K tokens |
+| gpt-4 (base) | ❌ | 24K chars | 8K tokens |
+| claude-3.5, claude-3-5, claude-4 | ✅ | 600K chars | 200K tokens |
+| claude (other) | ❌ | 300K chars | 100K tokens |
+| o1, o3, o4 series | ✅ | 384K chars | 128K tokens |
+| gemini | ✅ | 384K chars | 128K tokens |
+| deepseek | ❌ | 192K chars | 64K tokens |
+| phi-3, phi-4 | ❌ | 48K chars | 16K tokens |
+| mistral-large, mistral-medium | ❌ | 96K chars | 32K tokens |
+| mistral (small) | ❌ | 24K chars | 8K tokens |
+| codex, -pro models | ✅ | 48K chars | Responses API, body-size limited |
+| unknown | ❌ | 96K chars | Conservative 32K token default |
+
+### context_budget with reported override
+
+When the API reports a model's actual context window (e.g., from `context_length`
+in the discovery response), pass it to `context_budget()` to get a more accurate
+budget:
+
+```rust
+use agentive::context_budget;
+
+// Unknown deployment — uses heuristic (96K chars)
+let budget = context_budget("my-custom-deployment", None);
+
+// API reports 200K token context — overrides heuristic (600K chars)
+let budget = context_budget("my-custom-deployment", Some(200_000));
+```
+
+Formula: `reported_tokens × 75% (usable) × 4 (chars/token)`.
 
 ## Context trimming (context.rs)
 
@@ -368,7 +444,8 @@ let result = run(provider, messages, tools, executor, config, cancel, steering, 
 ## Tool execution pattern
 
 Tools are app-specific. The runner accepts an async closure that takes an
-owned `ToolCall` (not a reference, since async closures need owned data):
+owned `ToolCall` and returns `Result<ToolOutput, String>`:
+
 ```rust
 |call: ToolCall| async move {
     let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
@@ -376,12 +453,45 @@ owned `ToolCall` (not a reference, since async closures need owned data):
     match call.function.name.as_str() {
         "read_file" => {
             let path = args["path"].as_str().ok_or("missing path")?;
-            tokio::fs::read_to_string(path).await.map_err(|e| e.to_string())
+            let content = tokio::fs::read_to_string(path).await.map_err(|e| e.to_string())?;
+            Ok(ToolOutput::Text(content))
         }
         _ => Err(format!("Unknown tool: {}", call.function.name))
     }
 }
 ```
+
+### ToolOutput — text or multimodal results
+
+Tool executors return `ToolOutput` instead of plain `String`:
+
+```rust
+// Plain text result (most tools)
+ToolOutput::Text("file contents here".into())
+
+// Text + images (vision tools — e.g., screenshot, chart rendering)
+ToolOutput::WithImages {
+    text: "Screenshot of the current page".into(),
+    images: vec![
+        ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,iVBOR...".into(),
+                detail: Some("low".into()),
+            },
+        },
+    ],
+}
+```
+
+When a tool returns `WithImages`, the runner:
+
+1. Sends the `text` as a normal tool result message
+2. Appends a follow-up `ChatMessage::user_with_images()` containing the images
+   so the LLM can see them on the next turn
+
+**Backward compatibility**: `ToolOutput` implements `From<String>` and
+`From<&str>`, so existing closures that return `Ok("result".into())` work
+without changes.
 
 ## Dynamic tool gating
 
@@ -600,7 +710,7 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 107 tests (unit + doc + integration stubs)
+cargo test           # run all 195 tests (unit + doc + integration stubs)
 cargo doc --no-deps  # generate documentation
 ```
 
