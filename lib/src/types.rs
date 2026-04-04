@@ -65,6 +65,64 @@ pub struct ImageUrl {
     pub detail: Option<String>,
 }
 
+/// Output from a tool executor — either plain text or text with images.
+///
+/// When a tool produces images (e.g., screenshots, diagrams), return
+/// `ToolOutput::with_images(text, parts)`.  The runner will add the text as
+/// a normal tool result and inject a follow-up user message with the image
+/// content parts so the LLM can "see" them.
+///
+/// Plain `String` converts to `ToolOutput::Text` automatically via `From`,
+/// so existing executors returning `Result<String, String>` keep working
+/// when the signature is widened to `Result<ToolOutput, String>`.
+#[derive(Debug, Clone)]
+pub enum ToolOutput {
+    /// Plain text tool result.
+    Text(String),
+    /// Text result plus image content parts to inject as a follow-up user
+    /// message.  The `images` vec should contain `ContentPart::ImageUrl`
+    /// entries.
+    WithImages {
+        text: String,
+        images: Vec<ContentPart>,
+    },
+}
+
+impl ToolOutput {
+    /// Create a tool output with text and associated images.
+    pub fn with_images(text: impl Into<String>, images: Vec<ContentPart>) -> Self {
+        Self::WithImages { text: text.into(), images }
+    }
+
+    /// Get the text portion of this output.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Text(s) => s,
+            Self::WithImages { text, .. } => text,
+        }
+    }
+
+    /// Get the image parts, if any.
+    pub fn images(&self) -> Option<&[ContentPart]> {
+        match self {
+            Self::Text(_) => None,
+            Self::WithImages { images, .. } => Some(images),
+        }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
 // -- Chat messages -----------------------------------------------------------
 
 /// A message in a conversation.

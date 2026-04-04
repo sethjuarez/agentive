@@ -20,7 +20,7 @@
 //!     provider,
 //!     vec![ChatMessage::system("You are helpful"), ChatMessage::user("Hi")],
 //!     vec![],
-//!     |_call| async { Ok("not implemented".into()) },
+//!     |_call| async { Ok(ToolOutput::from("not implemented")) },
 //!     RunnerConfig::default(),
 //!     CancellationToken::new(),
 //!     Steering::new(),
@@ -254,7 +254,7 @@ pub async fn run<F, Fut, E>(
 ) -> Result<RunnerResult, AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<String, String>> + Send,
+    Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
     let run_id = config.run_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -567,7 +567,7 @@ async fn execute_tools_sequential<F, Fut, E>(
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = Result<String, String>> + Send,
+    Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
     let mut results = Vec::with_capacity(tool_calls.len());
@@ -587,21 +587,30 @@ where
         }
 
         let tool_start = std::time::Instant::now();
-        let (id, name, raw_result) = execute_tool_safe(tc.clone(), tool_executor).await?;
+        let (id, name, output) = execute_tool_safe(tc.clone(), tool_executor).await?;
         let elapsed_ms = tool_start.elapsed().as_millis() as u64;
-        let clean = if config.sanitize_tool_results {
-            sanitize_for_api(&raw_result)
+        let clean_text = if config.sanitize_tool_results {
+            sanitize_for_api(output.text())
         } else {
-            raw_result
+            output.text().to_string()
         };
         on_event(RunnerEvent::ToolResult {
             name,
-            result: clean.clone(),
+            result: clean_text.clone(),
             tool_call_id: id.clone(),
             elapsed_ms,
             iteration,
         });
-        results.push(ChatMessage::tool_result(&id, &clean));
+        results.push(ChatMessage::tool_result(&id, &clean_text));
+        // Inject vision images as a follow-up user message
+        if let Some(images) = output.images() {
+            if !images.is_empty() {
+                results.push(ChatMessage::user_with_images(
+                    "[Images from the tool result above — analyze these along with the text.]",
+                    images.to_vec(),
+                ));
+            }
+        }
     }
     Ok(results)
 }
@@ -617,7 +626,7 @@ async fn execute_tools_parallel<F, Fut, E>(
 ) -> Result<Vec<ChatMessage>, AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<String, String>> + Send,
+    Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
     let futures: Vec<_> = tool_calls.iter().map(|tc| {
@@ -630,11 +639,11 @@ where
             let tool_start = std::time::Instant::now();
             if let Some(reason) = denied {
                 let elapsed_ms = tool_start.elapsed().as_millis() as u64;
-                Ok((tc_clone.id.clone(), tc_clone.function.name.clone(), format!("Tool denied by guardrail: {}", reason), elapsed_ms))
+                Ok((tc_clone.id.clone(), tc_clone.function.name.clone(), ToolOutput::Text(format!("Tool denied by guardrail: {}", reason)), elapsed_ms))
             } else {
                 let result = execute_tool_safe(tc_clone, tool_executor).await;
                 let elapsed_ms = tool_start.elapsed().as_millis() as u64;
-                result.map(|(id, name, raw)| (id, name, raw, elapsed_ms))
+                result.map(|(id, name, output)| (id, name, output, elapsed_ms))
             }
         }
     }).collect();
@@ -643,29 +652,38 @@ where
 
     let mut messages = Vec::with_capacity(tool_calls.len());
     for res in results {
-        let (id, name, raw, elapsed_ms) = res?;
-        let clean = if config.sanitize_tool_results {
-            sanitize_for_api(&raw)
+        let (id, name, output, elapsed_ms) = res?;
+        let clean_text = if config.sanitize_tool_results {
+            sanitize_for_api(output.text())
         } else {
-            raw
+            output.text().to_string()
         };
         on_event(RunnerEvent::ToolResult {
             name,
-            result: clean.clone(),
+            result: clean_text.clone(),
             tool_call_id: id.clone(),
             elapsed_ms,
             iteration,
         });
-        messages.push(ChatMessage::tool_result(&id, &clean));
+        messages.push(ChatMessage::tool_result(&id, &clean_text));
+        // Inject vision images as a follow-up user message
+        if let Some(images) = output.images() {
+            if !images.is_empty() {
+                messages.push(ChatMessage::user_with_images(
+                    "[Images from the tool result above — analyze these along with the text.]",
+                    images.to_vec(),
+                ));
+            }
+        }
     }
     Ok(messages)
 }
 
 /// Execute a single tool call with panic safety via `catch_unwind` on the async future.
-async fn execute_tool_safe<F, Fut>(tc: ToolCall, tool_executor: &F) -> Result<(String, String, String), AgentError>
+async fn execute_tool_safe<F, Fut>(tc: ToolCall, tool_executor: &F) -> Result<(String, String, ToolOutput), AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync,
-    Fut: std::future::Future<Output = Result<String, String>> + Send,
+    Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
 {
     let name = tc.function.name.clone();
     let id = tc.id.clone();
@@ -676,7 +694,7 @@ where
 
     match result {
         Ok(Ok(r)) => Ok((id, name, r)),
-        Ok(Err(e)) => Ok((id, name, format!("Tool error: {}", e))),
+        Ok(Err(e)) => Ok((id, name, ToolOutput::Text(format!("Tool error: {}", e)))),
         Err(panic_info) => {
             let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                 s.to_string()
@@ -903,7 +921,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| async { Ok("unused".into()) },            RunnerConfig::default(),
+            |_| async { Ok(ToolOutput::from("unused")) },            RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
             Guardrails::default(),
@@ -953,7 +971,7 @@ mod tests {
             )],
             |call| async move {
                 assert_eq!(call.function.name, "read_file");
-                Ok("hello world".into())
+                Ok(ToolOutput::from("hello world"))
             },
             RunnerConfig::default(),
             CancellationToken::new(),
@@ -1019,7 +1037,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("loop forever")],
             vec![Tool::function("loop_tool", "loops", serde_json::json!({}))],
-            |_| async { Ok("looping".into()) },
+            |_| async { Ok(ToolOutput::from("looping")) },
             RunnerConfig {
                 max_iterations: 3,
                 ..Default::default()
@@ -1065,7 +1083,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("Do the thing")],
             vec![Tool::function("slow_tool", "a tool", serde_json::json!({}))],
-            |_| async { Ok("tool result".into()) },
+            |_| async { Ok(ToolOutput::from("tool result")) },
             RunnerConfig::default(),
             CancellationToken::new(),
             steering,
@@ -1116,7 +1134,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("go")],
             vec![Tool::function("tool1", "a tool", serde_json::json!({}))],
-            |_| async { Ok("ok".into()) },
+            |_| async { Ok(ToolOutput::from("ok")) },
             RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
@@ -1186,7 +1204,7 @@ mod tests {
                 let cc = count_clone.clone();
                 async move {
                     cc.fetch_add(1, Ordering::SeqCst);
-                    Ok(format!("result from {}", tc.function.name))
+                    Ok(ToolOutput::from(format!("result from {}", tc.function.name)))
                 }
             },
             RunnerConfig {
@@ -1331,7 +1349,7 @@ mod tests {
                 Tool::function("safe_tool", "safe", serde_json::json!({})),
                 Tool::function("dangerous_tool", "dangerous", serde_json::json!({})),
             ],
-            |_| async { Ok("safe result".into()) },
+            |_| async { Ok(ToolOutput::from("safe result")) },
             RunnerConfig {
                 parallel_tool_calls: false, // sequential so we can test order
                 ..Default::default()
@@ -1848,7 +1866,7 @@ mod tests {
                 Tool::function("allowed_tool", "ok", serde_json::json!({})),
                 Tool::function("blocked_tool", "nope", serde_json::json!({})),
             ],
-            |_| async { Ok("tool succeeded".into()) },
+            |_| async { Ok(ToolOutput::from("tool succeeded")) },
             RunnerConfig {
                 parallel_tool_calls: true,
                 ..Default::default()
@@ -1910,7 +1928,7 @@ mod tests {
                 if tc.function.name == "bad_tool" {
                     panic!("parallel panic test");
                 }
-                Ok("good result".into())
+                Ok(ToolOutput::from("good result"))
             },
             RunnerConfig {
                 parallel_tool_calls: true,
@@ -1967,7 +1985,7 @@ mod tests {
                 let cc = count_clone.clone();
                 async move {
                     cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok("tool result".into())
+                    Ok(ToolOutput::from("tool result"))
                 }
             },
             RunnerConfig {
@@ -2051,7 +2069,7 @@ mod tests {
                     // Simulate async I/O (like a network request)
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     cc.fetch_add(1, Ordering::SeqCst);
-                    Ok("async result".into())
+                    Ok(ToolOutput::from("async result"))
                 }
             },
             RunnerConfig {
@@ -2125,7 +2143,7 @@ mod tests {
                     // Small delay to make ordering visible
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     oc.lock().unwrap().push(tc.function.name.clone());
-                    Ok(format!("result from {}", tc.function.name))
+                    Ok(ToolOutput::from(format!("result from {}", tc.function.name)))
                 }
             },
             RunnerConfig {
@@ -2198,7 +2216,7 @@ mod tests {
             main_provider,
             messages,
             vec![],
-            |_| async { Ok("unused".into()) },
+            |_| async { Ok(ToolOutput::from("unused")) },
             RunnerConfig {
                 auto_trim_context: true,
                 compaction_provider: Some(Arc::new(CompactionProvider)),
@@ -2287,7 +2305,7 @@ mod tests {
             main_provider,
             messages,
             vec![],
-            |_| async { Ok("unused".into()) },
+            |_| async { Ok(ToolOutput::from("unused")) },
             RunnerConfig {
                 auto_trim_context: true,
                 compaction_provider: Some(Arc::new(FailingCompactionProvider)),
@@ -2337,7 +2355,7 @@ mod tests {
             main_provider,
             messages,
             vec![],
-            |_| async { Ok("unused".into()) },
+            |_| async { Ok(ToolOutput::from("unused")) },
             RunnerConfig {
                 auto_trim_context: true,
                 ..Default::default()
@@ -2408,7 +2426,7 @@ mod tests {
                 let cc2 = cc.clone();
                 async move {
                     cc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(format!("result from {}", tc.function.name))
+                    Ok(ToolOutput::from(format!("result from {}", tc.function.name)))
                 }
             },
             RunnerConfig {
@@ -2468,7 +2486,7 @@ mod tests {
             provider,
             vec![ChatMessage::user("go")],
             vec![Tool::function("my_tool", "a tool", serde_json::json!({}))],
-            |_| async { Ok("tool output".into()) },
+            |_| async { Ok(ToolOutput::from("tool output")) },
             RunnerConfig {
                 run_id: Some("test-run-42".into()),
                 parent_run_id: Some("parent-run-1".into()),
@@ -2686,7 +2704,7 @@ mod tests {
                 ChatMessage::user("Please review @context.md"),
             ],
             vec![],
-            |_tc| async { Ok("done".into()) },
+            |_tc| async { Ok(ToolOutput::from("done")) },
             RunnerConfig {
                 reference_resolver: Some(resolver),
                 ..Default::default()
@@ -2706,5 +2724,71 @@ mod tests {
         let text = user_msg.text().unwrap();
         assert!(text.contains("Important context document."), "resolved content should be in messages");
         assert!(text.contains("<referenced_document"), "should have XML wrapper");
+    }
+
+    #[tokio::test]
+    async fn test_tool_output_with_images_injects_user_message() {
+        // Provider expects: user msg → assistant tool call → tool result + user images → final answer
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "tc1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_sketch".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("I can see the screenshot shows a login form."),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("describe the sketch")],
+            vec![Tool::function("read_sketch", "Read a sketch", serde_json::json!({}))],
+            |_tc| async {
+                Ok(ToolOutput::with_images(
+                    "Sketch title: Login Page",
+                    vec![ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "data:image/png;base64,abc123".into(),
+                            detail: Some("low".into()),
+                        },
+                    }],
+                ))
+            },
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.response, "I can see the screenshot shows a login form.");
+
+        // Should have: user, assistant(tool_call), tool_result, user(images), assistant(final)
+        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert_eq!(tool_msgs[0].text().unwrap(), "Sketch title: Login Page");
+
+        // The injected user message with images should follow the tool result
+        let image_msgs: Vec<_> = result.messages.iter().filter(|m| {
+            m.role == "user" && matches!(&m.content, Some(MessageContent::Parts(_)))
+        }).collect();
+        assert_eq!(image_msgs.len(), 1, "should inject one user message with images");
+
+        if let Some(MessageContent::Parts(parts)) = &image_msgs[0].content {
+            assert!(parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })));
+            assert!(parts.iter().any(|p| matches!(p, ContentPart::Text { .. })));
+        } else {
+            panic!("expected Parts content");
+        }
     }
 }

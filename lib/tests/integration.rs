@@ -48,7 +48,7 @@ async fn test_openai_simple_chat() {
             ChatMessage::user("What is 2 + 2?"),
         ],
         vec![],
-        |_| async { Ok("unused".into()) },
+        |_| async { Ok(agentive::ToolOutput::from("unused")) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -109,7 +109,7 @@ async fn test_openai_tool_calling() {
                 parse_tool_args(&tc.function.arguments).unwrap_or_default();
             let a = args["a"].as_f64().unwrap_or(0.0);
             let b = args["b"].as_f64().unwrap_or(0.0);
-            Ok(format!("{}", a + b))
+            Ok(agentive::ToolOutput::from(format!("{}", a + b)))
         },
         RunnerConfig::default(),
         CancellationToken::new(),
@@ -145,7 +145,7 @@ async fn test_anthropic_simple_chat() {
             ChatMessage::user("What is the capital of France?"),
         ],
         vec![],
-        |_| async { Ok("unused".into()) },
+        |_| async { Ok(agentive::ToolOutput::from("unused")) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -197,7 +197,7 @@ async fn test_anthropic_tool_calling() {
                 parse_tool_args(&tc.function.arguments).unwrap_or_default();
             let a = args["a"].as_f64().unwrap_or(0.0);
             let b = args["b"].as_f64().unwrap_or(0.0);
-            Ok(format!("{}", a + b))
+            Ok(agentive::ToolOutput::from(format!("{}", a + b)))
         },
         RunnerConfig::default(),
         CancellationToken::new(),
@@ -249,7 +249,7 @@ async fn test_azure_openai_chat() {
             ChatMessage::user("What color is the sky on a clear day?"),
         ],
         vec![],
-        |_| async { Ok("unused".into()) },
+        |_| async { Ok(agentive::ToolOutput::from("unused")) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -288,7 +288,7 @@ async fn test_direct_openai_simple_chat() {
             ChatMessage::user("What is 2 + 2?"),
         ],
         vec![],
-        |_| async { Ok("unused".into()) },
+        |_| async { Ok(agentive::ToolOutput::from("unused")) },
         RunnerConfig {
             max_iterations: 1,
             ..Default::default()
@@ -358,7 +358,7 @@ async fn test_direct_openai_tool_calling() {
                 parse_tool_args(&tc.function.arguments).unwrap_or_default();
             let a = args["a"].as_f64().unwrap_or(0.0);
             let b = args["b"].as_f64().unwrap_or(0.0);
-            Ok(format!("{}", a + b))
+            Ok(agentive::ToolOutput::from(format!("{}", a + b)))
         },
         RunnerConfig::default(),
         CancellationToken::new(),
