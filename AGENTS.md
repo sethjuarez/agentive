@@ -254,20 +254,30 @@ Handles Anthropic-specific concerns:
 - `thinking_delta` events for extended thinking models
 
 ### ResponsesProvider
+
 OpenAI Responses API (`/v1/responses`) — newer endpoint with different format:
+
 ```rust
 ResponsesProvider::new(endpoint, api_key, model)
-    .with_context_budget(128_000)  // optional
-    .with_vision(true)             // optional
+    .with_context_budget(128_000)    // optional
+    .with_vision(true)               // optional
+    .with_max_request_bytes(64_000)  // optional (64KB default)
 ```
 
 Key differences from Chat Completions:
+
 - System messages → `role: "developer"` input items
 - Tool calls → separate `function_call` input items (not nested in assistant)
 - Tool results → `function_call_output` input items
 - SSE events: `response.output_text.delta`, `response.output_item.added`,
   `response.function_call_arguments.delta`, `response.completed`
 - Tool defs are flattened (no `function` wrapper)
+- **Request body guard**: The Azure Responses API silently truncates bodies at
+  ~79KB. The provider measures the actual serialized JSON byte count and drops
+  the oldest non-system input items until the body fits within
+  `max_request_bytes` (default 64KB). `function_call` / `function_call_output`
+  pairs are dropped together to avoid orphaned tool results. Set
+  `with_max_request_bytes(usize::MAX)` to disable.
 
 ## Provider factory (factory.rs)
 
@@ -634,19 +644,18 @@ agentive = { git = "https://github.com/sethjuarez/agentive", path = "lib" }
 
 ### Chat URL construction (providers/openai.rs)
 
-`OpenAiProvider::chat_url()` handles three cases:
+`OpenAiProvider::chat_url()` handles four cases:
 
 | Endpoint type | Chat URL built |
-|---|---|
+| --- | --- |
 | Already contains `/chat/completions` | Used as-is |
 | Foundry project (`/api/projects/`) | **Strips** `/api/projects/...` → `{resource_base}/openai/deployments/{model}/chat/completions?api-version=2024-10-21` |
-| Everything else | `{endpoint}/chat/completions` |
+| Plain Azure (`*.azure.com`) | `{endpoint}/openai/deployments/{model}/chat/completions?api-version=2024-10-21` |
+| Everything else (OpenAI, local) | `{endpoint}/chat/completions` |
 
-**Critical**: For Foundry projects, the `/api/projects/{name}` path is stripped
-to use the resource-level endpoint. The project-scoped URL does NOT support the
-OpenAI chat completions path. The model/deployment name goes into the URL
-(deployment-based routing), NOT model routing via the request body. This matches
-CutReady's proven production pattern.
+**Critical**: For Azure endpoints (both Foundry and plain), the model name is
+used as the deployment name in the URL path. For non-Azure endpoints, the model
+is sent in the request body only.
 
 ### ARM resource discovery (arm_discovery.rs)
 
