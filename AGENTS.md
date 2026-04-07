@@ -34,6 +34,7 @@ lib/src/
 ├── runner.rs               # Agentic loop: run(), RunnerConfig, RunnerEvent, @reference resolver
 ├── context.rs              # Context window trimming + LLM-powered summarization
 ├── sanitize.rs             # Tool result sanitization
+├── memory.rs               # Agent memory: MemoryStore, recall, system prompt injection, tool defs
 ├── discovery.rs            # Model listing across endpoint types
 ├── arm_discovery.rs        # Azure subscription/resource/project discovery via ARM
 └── azure_oauth.rs          # OAuth PKCE + device code flows for Entra ID
@@ -576,6 +577,106 @@ Welcome to the demo.
 - **CutReady**: `@sketch.sk` resolves to sketch JSON, `@notes.md` to markdown content
 - **sethjuarez.com**: `@blog-post` resolves to content by slug
 - **Any app**: files, database records, API responses, embeddings — the resolver is fully app-defined
+
+## Memory (memory.rs)
+
+Agent memory for persistent knowledge across conversations. Based on a five-layer
+cognitive model:
+
+| Layer | Purpose | Managed by |
+| --- | --- | --- |
+| **Working** | Active conversation context | `run()` + context trimming |
+| **Procedural** | Tool definitions & system prompts | Static per session |
+| **Core** | Persistent project/user facts | `save_memory` tool |
+| **Archival** | Compressed session summaries | Auto-saved on session end |
+| **Recall** | On-demand memory search | `recall_memory` tool |
+
+### Core types
+
+```rust
+use agentive::memory::{MemoryStore, MemoryCategory, MemoryEntry, MemoryBackend};
+
+let mut store = MemoryStore::default();
+
+// Save memories (core memories dedup by tags)
+store.save(MemoryCategory::Core, "User prefers concise output", vec!["style".into()]);
+store.save(MemoryCategory::Insight, "Dashboard needs chart builder", vec!["dashboard".into()]);
+store.archive_session("Discussed login flow", "session-42");
+
+// Search with keyword scoring (+3 tag match, +2 content match, +1 core boost)
+let results = store.recall("dashboard");
+
+// Inject core memories into system prompt
+let prompt_block = store.format_for_system_prompt();
+// → "\n[Memories about this project and user]\n• User prefers concise output\n"
+
+// Format search results for LLM
+let formatted = MemoryStore::format_recall_results(&results);
+```
+
+### Capacity management
+
+- **Max 200 entries**. When exceeded, oldest archival entries are evicted first.
+- **Core dedup**: saving a core memory with the same tags replaces the previous one.
+
+### Persistence via `MemoryBackend`
+
+The module provides the in-memory data model and operations. Persistence is
+pluggable — apps implement `MemoryBackend` to choose their storage:
+
+```rust
+pub trait MemoryBackend: Send + Sync {
+    fn load(&self) -> MemoryStore;
+    fn save(&self, store: &MemoryStore) -> Result<(), String>;
+}
+```
+
+Example file backend:
+
+```rust
+struct FileMemory { path: PathBuf }
+
+impl MemoryBackend for FileMemory {
+    fn load(&self) -> MemoryStore {
+        std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self, store: &MemoryStore) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, json).map_err(|e| e.to_string())
+    }
+}
+```
+
+### Tool definitions
+
+Two standard tool definitions for LLM function calling:
+
+```rust
+use agentive::memory;
+
+let tools = vec![
+    memory::recall_memory_tool(),  // "recall_memory" — keyword search
+    memory::save_memory_tool(),    // "save_memory" — persist core/insight
+    // ... other app tools
+];
+```
+
+These return `Tool` structs ready to pass to `run()`. The app's tool executor
+handles the actual call by delegating to `MemoryStore` methods.
+
+### Integration pattern
+
+A typical app wires memory like this:
+
+1. On startup: `let store = backend.load();`
+2. Before `run()`: inject `store.format_for_system_prompt()` into system message
+3. Tool executor: `"recall_memory" => store.recall(query)`,
+   `"save_memory" => store.save(cat, content, tags)`
+4. After each tool mutation: `backend.save(&store)`
+5. On session end: `store.archive_session(summary, session_id)`
 
 ## Guardrails (guardrails.rs)
 
