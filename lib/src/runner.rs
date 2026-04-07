@@ -724,12 +724,20 @@ where
 /// Returns deduplicated names in the order they first appear (without the `@` prefix or quotes).
 fn extract_references(text: &str) -> Vec<String> {
     // Quoted: @"anything inside quotes"
+    // URL: @https://... or @http://... (greedy up to whitespace/quote)
     // Unquoted: @word characters (alphanum, -, _, ., /)
-    let re = Regex::new(r#"@"([^"]+)"|@([\w.\-/]+)"#).expect("invalid reference regex");
+    let re = Regex::new(r#"@"([^"]+)"|@(https?://[^\s"<>]+)|@([\w.\-/]+)"#)
+        .expect("invalid reference regex");
     let mut seen = std::collections::HashSet::new();
     let mut refs = Vec::new();
     for cap in re.captures_iter(text) {
-        let name = cap.get(1).or_else(|| cap.get(2)).unwrap().as_str().to_string();
+        let name = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .or_else(|| cap.get(3))
+            .unwrap()
+            .as_str()
+            .to_string();
         if seen.insert(name.clone()) {
             refs.push(name);
         }
@@ -752,7 +760,8 @@ fn format_resolved_context(resolved: &[(String, ResolvedReference)]) -> String {
 /// Resolve `@references` in user messages using the provided resolver.
 ///
 /// Scans each user message for `@name` patterns. For each unique reference found,
-/// calls the resolver. Resolved content is appended to the message as XML-tagged
+/// calls the resolver. URL references (`@https://...`) are resolved using the
+/// built-in web fetcher. Resolved content is appended to the message as XML-tagged
 /// context blocks. Messages that have already been resolved (contain
 /// `<referenced_document`) are skipped to avoid re-resolution.
 async fn resolve_references_in_messages(
@@ -783,8 +792,31 @@ async fn resolve_references_in_messages(
                 let name = name.clone();
                 let resolver = resolver.clone();
                 async move {
-                    let resolved = resolver(name.clone()).await;
-                    (name, resolved)
+                    // URL references are handled by the built-in web fetcher
+                    if name.starts_with("http://") || name.starts_with("https://") {
+                        match crate::web::fetch_and_clean(&name).await {
+                            Ok(content) => {
+                                let resolved = ResolvedReference {
+                                    name: name.clone(),
+                                    content,
+                                    content_type: "text/plain".to_string(),
+                                };
+                                (name, Some(resolved))
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to fetch URL reference {}: {}", name, e);
+                                let resolved = ResolvedReference {
+                                    name: name.clone(),
+                                    content: format!("[Error fetching URL: {e}]"),
+                                    content_type: "text/plain".to_string(),
+                                };
+                                (name, Some(resolved))
+                            }
+                        }
+                    } else {
+                        let resolved = resolver(name.clone()).await;
+                        (name, resolved)
+                    }
                 }
             })
             .collect();
@@ -2602,6 +2634,28 @@ mod tests {
     fn test_extract_references_at_start() {
         let refs = extract_references("@first is the reference");
         assert_eq!(refs, vec!["first"]);
+    }
+
+    #[test]
+    fn test_extract_references_url() {
+        let refs = extract_references("Check @https://example.com/article for details");
+        assert_eq!(refs, vec!["https://example.com/article"]);
+    }
+
+    #[test]
+    fn test_extract_references_url_with_query() {
+        let refs =
+            extract_references("See @https://docs.rs/agentive/latest?q=web and @blog/intro");
+        assert_eq!(
+            refs,
+            vec!["https://docs.rs/agentive/latest?q=web", "blog/intro"]
+        );
+    }
+
+    #[test]
+    fn test_extract_references_http_url() {
+        let refs = extract_references("Read @http://localhost:3000/api/docs");
+        assert_eq!(refs, vec!["http://localhost:3000/api/docs"]);
     }
 
     #[tokio::test]

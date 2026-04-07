@@ -47,6 +47,7 @@ pub mod runner;
 pub mod sanitize;
 pub mod steering;
 pub mod types;
+pub mod web;
 
 pub use auth::AuthStrategy;
 pub use cancel::CancellationToken;
