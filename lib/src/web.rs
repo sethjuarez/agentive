@@ -119,7 +119,18 @@ fn extract_text(el: &scraper::ElementRef) -> String {
                 if let Some(child_el) = scraper::ElementRef::wrap(child) {
                     let child_text = extract_text(&child_el);
                     if !child_text.is_empty() {
-                        if BLOCK_TAGS.contains(&tag) {
+                        if tag == "a" {
+                            // Preserve links as markdown so agents can follow them
+                            let href = e.attr("href").unwrap_or("");
+                            if !href.is_empty()
+                                && !href.starts_with('#')
+                                && !href.starts_with("javascript:")
+                            {
+                                parts.push(format!("[{child_text}]({href})"));
+                            } else {
+                                parts.push(child_text);
+                            }
+                        } else if BLOCK_TAGS.contains(&tag) {
                             parts.push(format!("\n{child_text}\n"));
                         } else {
                             parts.push(child_text);
@@ -267,5 +278,54 @@ mod tests {
         assert_eq!(tool.function.name, "fetch_url");
         let params = &tool.function.parameters;
         assert_eq!(params["required"][0], "url");
+    }
+
+    #[test]
+    fn html_to_text_preserves_links_as_markdown() {
+        let html = r#"
+            <html><body>
+                <main>
+                    <p>Read the <a href="https://example.com/docs">documentation</a> for details.</p>
+                    <p>Also see the <a href="/api/reference">API reference</a>.</p>
+                </main>
+            </body></html>
+        "#;
+        let text = html_to_text(html);
+        assert!(text.contains("[documentation](https://example.com/docs)"));
+        assert!(text.contains("[API reference](/api/reference)"));
+    }
+
+    #[test]
+    fn html_to_text_skips_anchor_and_javascript_links() {
+        let html = concat!(
+            "<html><body><main>",
+            r#"<p><a href=""#,
+            r#"section">Jump to section</a></p>"#,
+            r#"<p><a href="javascript:void(0)">Do nothing</a></p>"#,
+            r#"<p><a href="">Empty href</a></p>"#,
+            r#"<p><a>No href at all</a></p>"#,
+            "</main></body></html>",
+        );
+        let text = html_to_text(html);
+        // These should render as plain text, not markdown links
+        assert!(text.contains("Jump to section"));
+        assert!(!text.contains("](#"));
+        assert!(!text.contains("javascript:"));
+        assert!(text.contains("Do nothing"));
+        assert!(text.contains("Empty href"));
+        assert!(text.contains("No href at all"));
+    }
+
+    #[test]
+    fn html_to_text_nested_link_content() {
+        let html = r#"
+            <html><body>
+                <main>
+                    <p>See <a href="https://example.com"><strong>bold link</strong> text</a> here.</p>
+                </main>
+            </body></html>
+        "#;
+        let text = html_to_text(html);
+        assert!(text.contains("[bold link text](https://example.com)"));
     }
 }
