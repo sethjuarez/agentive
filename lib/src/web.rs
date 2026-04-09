@@ -94,6 +94,36 @@ pub fn html_to_text(html: &str) -> String {
 
 /// Recursively extract text from an element, skipping noise elements.
 fn extract_text(el: &scraper::ElementRef) -> String {
+    extract_text_inner(el, false)
+}
+
+/// Returns true if `href` is a web-navigable URL (http(s) or relative path).
+fn is_followable_href(href: &str) -> bool {
+    if href.is_empty() || href.starts_with('#') {
+        return false;
+    }
+    // Relative URLs (paths, query strings, protocol-relative)
+    if href.starts_with('/') || href.starts_with('?') {
+        return true;
+    }
+    // Only allow http(s) absolute URLs
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return true;
+    }
+    // Reject everything else: javascript:, mailto:, tel:, ftp:, data:, etc.
+    // Also reject bare words that look like schemes (contain ":")
+    !href.contains(':')
+}
+
+/// Escape characters that break markdown link syntax in link text.
+fn escape_link_text(text: &str) -> String {
+    text.replace('[', r"\[")
+        .replace(']', r"\]")
+        .replace('(', r"\(")
+        .replace(')', r"\)")
+}
+
+fn extract_text_inner(el: &scraper::ElementRef, inside_link: bool) -> String {
     const SKIP_TAGS: &[&str] = &[
         "script", "style", "nav", "header", "footer", "noscript", "svg", "iframe",
     ];
@@ -117,23 +147,26 @@ fn extract_text(el: &scraper::ElementRef) -> String {
                     continue;
                 }
                 if let Some(child_el) = scraper::ElementRef::wrap(child) {
-                    let child_text = extract_text(&child_el);
-                    if !child_text.is_empty() {
-                        if tag == "a" {
-                            // Preserve links as markdown so agents can follow them
-                            let href = e.attr("href").unwrap_or("");
-                            if !href.is_empty()
-                                && !href.starts_with('#')
-                                && !href.starts_with("javascript:")
-                            {
-                                parts.push(format!("[{child_text}]({href})"));
+                    if tag == "a" && !inside_link {
+                        let href = e.attr("href").unwrap_or("");
+                        // Extract child text in inside_link mode to suppress nested links
+                        let child_text = extract_text_inner(&child_el, true);
+                        if !child_text.is_empty() {
+                            if is_followable_href(href) {
+                                let safe_text = escape_link_text(&child_text);
+                                parts.push(format!("[{safe_text}]({href})"));
                             } else {
                                 parts.push(child_text);
                             }
-                        } else if BLOCK_TAGS.contains(&tag) {
-                            parts.push(format!("\n{child_text}\n"));
-                        } else {
-                            parts.push(child_text);
+                        }
+                    } else {
+                        let child_text = extract_text_inner(&child_el, inside_link);
+                        if !child_text.is_empty() {
+                            if BLOCK_TAGS.contains(&tag) {
+                                parts.push(format!("\n{child_text}\n"));
+                            } else {
+                                parts.push(child_text);
+                            }
                         }
                     }
                 }
@@ -327,5 +360,69 @@ mod tests {
         "#;
         let text = html_to_text(html);
         assert!(text.contains("[bold link text](https://example.com)"));
+    }
+
+    #[test]
+    fn html_to_text_escapes_brackets_in_link_text() {
+        let html = r#"
+            <html><body><main>
+                <p><a href="https://example.com">Click [here](fake) for info</a></p>
+            </main></body></html>
+        "#;
+        let text = html_to_text(html);
+        // Brackets and parens in link text must be escaped
+        assert!(text.contains(r"[Click \[here\]\(fake\) for info](https://example.com)"));
+        assert!(!text.contains("[Click [here]"));
+    }
+
+    #[test]
+    fn html_to_text_filters_mailto_and_tel_links() {
+        let html = r#"
+            <html><body><main>
+                <p><a href="mailto:user@example.com">Email us</a></p>
+                <p><a href="tel:+1234567890">Call us</a></p>
+                <p><a href="ftp://files.example.com">FTP server</a></p>
+                <p><a href="https://example.com">Website</a></p>
+            </main></body></html>
+        "#;
+        let text = html_to_text(html);
+        // mailto/tel/ftp should be plain text, not markdown links
+        assert!(text.contains("Email us"));
+        assert!(!text.contains("](mailto:"));
+        assert!(text.contains("Call us"));
+        assert!(!text.contains("](tel:"));
+        assert!(!text.contains("](ftp:"));
+        // https should still work
+        assert!(text.contains("[Website](https://example.com)"));
+    }
+
+    #[test]
+    fn html_to_text_nested_a_tags_flatten() {
+        // HTML5 parsers auto-close <a> when encountering a nested <a>,
+        // producing sibling links rather than truly nested ones.
+        // Both siblings should become independent markdown links.
+        let html = r#"
+            <html><body><main>
+                <p><a href="https://outer.com">outer <a href="https://inner.com">inner</a> end</a></p>
+            </main></body></html>
+        "#;
+        let text = html_to_text(html);
+        // Should NOT produce double-bracket nesting like [[inner](url)](url)
+        assert!(!text.contains("[["));
+    }
+
+    #[test]
+    fn is_followable_href_unit() {
+        assert!(is_followable_href("https://example.com"));
+        assert!(is_followable_href("http://example.com"));
+        assert!(is_followable_href("/docs/api"));
+        assert!(is_followable_href("?q=test"));
+        assert!(is_followable_href("relative/path"));
+        assert!(!is_followable_href(""));
+        assert!(!is_followable_href("mailto:user@example.com"));
+        assert!(!is_followable_href("javascript:void(0)"));
+        assert!(!is_followable_href("tel:+1234567890"));
+        assert!(!is_followable_href("ftp://files.example.com"));
+        assert!(!is_followable_href("data:text/html,<h1>hi</h1>"));
     }
 }
