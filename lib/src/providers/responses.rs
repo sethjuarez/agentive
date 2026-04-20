@@ -224,12 +224,13 @@ impl ResponsesProvider {
         &self,
         input: &mut Vec<serde_json::Value>,
         tools_json: &Option<serde_json::Value>,
+        stream: bool,
     ) -> Result<serde_json::Value, AgentError> {
         let make_body = |input: &[serde_json::Value]| -> serde_json::Value {
             let mut b = serde_json::json!({
                 "model": self.model,
                 "input": input,
-                "stream": true,
+                "stream": stream,
             });
             if let Some(ref tools) = tools_json {
                 b["tools"] = tools.clone();
@@ -322,7 +323,7 @@ impl Provider for ResponsesProvider {
         // The Azure Responses API silently truncates at ~79KB — we compact
         // by dropping oldest non-system input items until the serialized
         // body fits. This uses the actual byte count, not character estimates.
-        let body = self.build_body_within_limit(&mut input, &tools_json)?;
+        let body = self.build_body_within_limit(&mut input, &tools_json, request.stream)?;
 
         let mut req = self.client.post(self.responses_url()).json(&body);
         req = self.auth.apply(req);
@@ -336,6 +337,10 @@ impl Provider for ResponsesProvider {
                 status,
                 message: text,
             });
+        }
+
+        if !request.stream {
+            return handle_non_streaming_response(response, tx).await;
         }
 
         let mut stream = response.bytes_stream();
@@ -494,6 +499,100 @@ impl Provider for ResponsesProvider {
     fn supports_vision(&self) -> bool {
         self.vision
     }
+}
+
+async fn handle_non_streaming_response(
+    response: reqwest::Response,
+    tx: mpsc::Sender<ChatEvent>,
+) -> Result<(), AgentError> {
+    let parsed: serde_json::Value = response.json().await?;
+    let usage = parsed.get("usage").map(parse_responses_usage).transpose()?;
+    let (content, tool_calls) = parse_responses_output(&parsed)?;
+
+    let message = ChatMessage {
+        role: "assistant".into(),
+        content: Some(MessageContent::Text(content)),
+        tool_calls,
+        tool_call_id: None,
+    };
+
+    let _ = tx
+        .send(ChatEvent::Done {
+            response: ChatResponse { message, usage },
+        })
+        .await;
+    Ok(())
+}
+
+fn parse_responses_usage(value: &serde_json::Value) -> Result<Usage, AgentError> {
+    let input_tokens = value.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let output_tokens = value.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Ok(Usage {
+        prompt_tokens: input_tokens,
+        completion_tokens: output_tokens,
+        total_tokens: input_tokens + output_tokens,
+    })
+}
+
+fn parse_responses_output(
+    parsed: &serde_json::Value,
+) -> Result<(String, Option<Vec<ToolCall>>), AgentError> {
+    let Some(output) = parsed.get("output").and_then(|output| output.as_array()) else {
+        return Err(AgentError::Stream(
+            "Non-streaming response missing output array".into(),
+        ));
+    };
+
+    let mut full_content = String::new();
+    let mut tool_calls = Vec::new();
+
+    for item in output {
+        match item.get("type").and_then(|kind| kind.as_str()) {
+            Some("message") => {
+                if let Some(content) = item.get("content").and_then(|content| content.as_array()) {
+                    for part in content {
+                        if part.get("type").and_then(|kind| kind.as_str()) == Some("output_text") {
+                            if let Some(text) = part.get("text").and_then(|text| text.as_str()) {
+                                full_content.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                tool_calls.push(ToolCall {
+                    id: item
+                        .get("call_id")
+                        .and_then(|call_id| call_id.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: item
+                            .get("name")
+                            .and_then(|name| name.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: item
+                            .get("arguments")
+                            .and_then(|arguments| arguments.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        full_content,
+        if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+    ))
 }
 
 /// Pending tool call accumulator for streaming.
@@ -683,11 +782,53 @@ mod tests {
             ChatMessage::user("Hello"),
         ];
         let mut input = provider.messages_to_input(&messages);
-        let body = provider.build_body_within_limit(&mut input, &None).unwrap();
+        let body = provider.build_body_within_limit(&mut input, &None, true).unwrap();
 
         // Small body should pass through unchanged
         assert_eq!(input.len(), 2);
         assert!(body.get("input").unwrap().as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn test_body_honors_non_streaming_request() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
+        let messages = vec![ChatMessage::user("Hello")];
+        let mut input = provider.messages_to_input(&messages);
+
+        let body = provider.build_body_within_limit(&mut input, &None, false).unwrap();
+
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn test_parse_non_streaming_responses_output() {
+        let parsed = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Hello"
+                }, {
+                    "type": "output_text",
+                    "text": " world"
+                }]
+            }, {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"test.txt\"}"
+            }]
+        });
+
+        let (content, tool_calls) = parse_responses_output(&parsed).unwrap();
+
+        assert_eq!(content, "Hello world");
+        let calls = tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"test.txt\"}");
     }
 
     #[test]
@@ -705,7 +846,7 @@ mod tests {
         let mut input = provider.messages_to_input(&messages);
         let original_len = input.len();
 
-        let body = provider.build_body_within_limit(&mut input, &None).unwrap();
+        let body = provider.build_body_within_limit(&mut input, &None, true).unwrap();
 
         // Should have dropped some items
         let final_len = body.get("input").unwrap().as_array().unwrap().len();
@@ -728,7 +869,7 @@ mod tests {
             ChatMessage::user("Short"),
         ];
         let mut input = provider.messages_to_input(&messages);
-        let _ = provider.build_body_within_limit(&mut input, &None).unwrap();
+        let _ = provider.build_body_within_limit(&mut input, &None, true).unwrap();
 
         // Developer (system) message should never be dropped
         assert!(input[0].get("role").unwrap().as_str().unwrap() == "developer");
@@ -747,7 +888,7 @@ mod tests {
             serde_json::json!({"role": "user", "content": "ok"}),
         ];
 
-        let _ = provider.build_body_within_limit(&mut input, &None).unwrap();
+        let _ = provider.build_body_within_limit(&mut input, &None, true).unwrap();
 
         // The function_call + its output should be dropped together
         // No orphaned function_call_output should remain
@@ -776,7 +917,7 @@ mod tests {
             ChatMessage::user(&"A".repeat(100_000)),
         ];
         let mut input = provider.messages_to_input(&messages);
-        let body = provider.build_body_within_limit(&mut input, &None).unwrap();
+        let body = provider.build_body_within_limit(&mut input, &None, true).unwrap();
 
         // With max disabled, no compaction should occur
         assert_eq!(body["input"].as_array().unwrap().len(), 2);

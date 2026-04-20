@@ -129,10 +129,13 @@ impl Provider for OpenAiProvider {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": request.messages,
-            "stream": true,
-            "stream_options": {"include_usage": true},
+            "stream": request.stream,
             "tools": request.tools,
         });
+
+        if request.stream {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
 
         // Add response_format if specified
         if let Some(ref rf) = request.response_format {
@@ -152,6 +155,10 @@ impl Provider for OpenAiProvider {
                 status,
                 message: text,
             });
+        }
+
+        if !request.stream {
+            return self.handle_non_streaming_response(response, tx).await;
         }
 
         let mut stream = response.bytes_stream();
@@ -306,7 +313,94 @@ impl Provider for OpenAiProvider {
     }
 }
 
+impl OpenAiProvider {
+    async fn handle_non_streaming_response(
+        &self,
+        response: reqwest::Response,
+        tx: mpsc::Sender<ChatEvent>,
+    ) -> Result<(), AgentError> {
+        let parsed: serde_json::Value = response.json().await?;
+        let usage = parsed
+            .get("usage")
+            .cloned()
+            .map(serde_json::from_value::<Usage>)
+            .transpose()?;
+
+        let Some(message_value) = parsed
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+        else {
+            return Err(AgentError::Stream(
+                "Non-streaming response missing choices[0].message".into(),
+            ));
+        };
+
+        let message = parse_chat_completion_message(message_value)?;
+        let _ = tx
+            .send(ChatEvent::Done {
+                response: ChatResponse { message, usage },
+            })
+            .await;
+        Ok(())
+    }
+}
+
 // -- Helpers -----------------------------------------------------------------
+
+fn parse_chat_completion_message(value: &serde_json::Value) -> Result<ChatMessage, AgentError> {
+    let role = value
+        .get("role")
+        .and_then(|role| role.as_str())
+        .unwrap_or("assistant")
+        .to_string();
+
+    let content = match value.get("content") {
+        Some(serde_json::Value::String(text)) => Some(MessageContent::Text(text.clone())),
+        Some(serde_json::Value::Array(parts)) => {
+            let parts = parts
+                .iter()
+                .filter_map(parse_content_part)
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(MessageContent::Parts(parts))
+            }
+        }
+        _ => None,
+    };
+
+    let tool_calls = value
+        .get("tool_calls")
+        .cloned()
+        .map(serde_json::from_value::<Vec<ToolCall>>)
+        .transpose()?;
+
+    Ok(ChatMessage {
+        role,
+        content,
+        tool_calls,
+        tool_call_id: None,
+    })
+}
+
+fn parse_content_part(value: &serde_json::Value) -> Option<ContentPart> {
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("text") => value
+            .get("text")
+            .and_then(|text| text.as_str())
+            .map(|text| ContentPart::Text {
+                text: text.to_string(),
+            }),
+        Some("image_url") => value
+            .get("image_url")
+            .cloned()
+            .and_then(|image_url| serde_json::from_value::<ImageUrl>(image_url).ok())
+            .map(|image_url| ContentPart::ImageUrl { image_url }),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 struct PendingToolCall {
@@ -487,6 +581,44 @@ mod tests {
             }
             _ => panic!("Expected Done"),
         }
+    }
+
+    #[test]
+    fn test_parse_non_streaming_message_content() {
+        let value = serde_json::json!({
+            "role": "assistant",
+            "content": "Hello world"
+        });
+
+        let message = parse_chat_completion_message(&value).unwrap();
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.text(), Some("Hello world"));
+        assert!(message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_parse_non_streaming_message_tool_calls() {
+        let value = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"test.txt\"}"
+                }
+            }]
+        });
+
+        let message = parse_chat_completion_message(&value).unwrap();
+        assert_eq!(message.role, "assistant");
+        assert!(message.text().is_none());
+        let calls = message.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, "{\"path\":\"test.txt\"}");
     }
 
     #[tokio::test]
