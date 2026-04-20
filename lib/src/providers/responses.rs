@@ -8,6 +8,7 @@
 //! (`ChatMessage`, `ToolCall`, etc.) and the Responses API format.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -325,14 +326,31 @@ impl Provider for ResponsesProvider {
         // body fits. This uses the actual byte count, not character estimates.
         let body = self.build_body_within_limit(&mut input, &tools_json, request.stream)?;
 
+        let started = Instant::now();
+        log::debug!(
+            "[agentive::responses] request start stream={} model={}",
+            request.stream,
+            self.model
+        );
+
         let mut req = self.client.post(self.responses_url()).json(&body);
         req = self.auth.apply(req);
 
         let response = req.send().await?;
+        log::debug!(
+            "[agentive::responses] response headers status={} elapsed={}ms",
+            response.status().as_u16(),
+            started.elapsed().as_millis()
+        );
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
+            log::warn!(
+                "[agentive::responses] request failed status={} elapsed={}ms",
+                status,
+                started.elapsed().as_millis()
+            );
             return Err(AgentError::Api {
                 status,
                 message: text,
@@ -340,7 +358,7 @@ impl Provider for ResponsesProvider {
         }
 
         if !request.stream {
-            return handle_non_streaming_response(response, tx).await;
+            return handle_non_streaming_response(response, tx, started).await;
         }
 
         let mut stream = response.bytes_stream();
@@ -351,6 +369,7 @@ impl Provider for ResponsesProvider {
         let mut full_content = String::new();
         let mut usage: Option<Usage> = None;
         let mut got_completed = false;
+        let mut saw_first_chunk = false;
 
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
@@ -358,6 +377,14 @@ impl Provider for ResponsesProvider {
             }
 
             let chunk = chunk.map_err(|e| AgentError::Stream(e.to_string()))?;
+            if !saw_first_chunk {
+                saw_first_chunk = true;
+                log::debug!(
+                    "[agentive::responses] first stream chunk elapsed={}ms bytes={}",
+                    started.elapsed().as_millis(),
+                    chunk.len()
+                );
+            }
             let data_lines = parser.feed(&chunk);
 
             for data in data_lines {
@@ -446,6 +473,11 @@ impl Provider for ResponsesProvider {
         }
 
         if !got_completed {
+            log::warn!(
+                "[agentive::responses] stream ended without completed elapsed={}ms response_chars={}",
+                started.elapsed().as_millis(),
+                full_content.chars().count()
+            );
             return Err(AgentError::Stream(
                 "Stream ended without response.completed".into(),
             ));
@@ -478,12 +510,23 @@ impl Provider for ResponsesProvider {
             tool_calls,
             tool_call_id: None,
         };
+        let response_chars = message
+            .content
+            .as_ref()
+            .map(|content| content.char_len())
+            .unwrap_or(0);
 
         let _ = tx
             .send(ChatEvent::Done {
                 response: ChatResponse { message, usage },
             })
             .await;
+        log::debug!(
+            "[agentive::responses] stream done elapsed={}ms response_chars={} tool_calls={}",
+            started.elapsed().as_millis(),
+            response_chars,
+            pending_tool_calls.len()
+        );
 
         Ok(())
     }
@@ -504,10 +547,13 @@ impl Provider for ResponsesProvider {
 async fn handle_non_streaming_response(
     response: reqwest::Response,
     tx: mpsc::Sender<ChatEvent>,
+    started: Instant,
 ) -> Result<(), AgentError> {
     let parsed: serde_json::Value = response.json().await?;
     let usage = parsed.get("usage").map(parse_responses_usage).transpose()?;
     let (content, tool_calls) = parse_responses_output(&parsed)?;
+    let response_chars = content.chars().count();
+    let tool_call_count = tool_calls.as_ref().map(|calls| calls.len()).unwrap_or(0);
 
     let message = ChatMessage {
         role: "assistant".into(),
@@ -521,6 +567,12 @@ async fn handle_non_streaming_response(
             response: ChatResponse { message, usage },
         })
         .await;
+    log::debug!(
+        "[agentive::responses] non-streaming done elapsed={}ms response_chars={} tool_calls={}",
+        started.elapsed().as_millis(),
+        response_chars,
+        tool_call_count
+    );
     Ok(())
 }
 

@@ -4,6 +4,7 @@
 //! that implements the `/chat/completions` SSE streaming protocol.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -143,14 +144,31 @@ impl Provider for OpenAiProvider {
                 .map_err(|e| AgentError::Stream(format!("Failed to serialize response_format: {}", e)))?;
         }
 
+        let started = Instant::now();
+        log::debug!(
+            "[agentive::openai] request start stream={} model={}",
+            request.stream,
+            self.model
+        );
+
         let mut req = self.client.post(self.chat_url()).json(&body);
         req = self.auth.apply(req);
 
         let response = req.send().await?;
+        log::debug!(
+            "[agentive::openai] response headers status={} elapsed={}ms",
+            response.status().as_u16(),
+            started.elapsed().as_millis()
+        );
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
+            log::warn!(
+                "[agentive::openai] request failed status={} elapsed={}ms",
+                status,
+                started.elapsed().as_millis()
+            );
             return Err(AgentError::Api {
                 status,
                 message: text,
@@ -158,7 +176,7 @@ impl Provider for OpenAiProvider {
         }
 
         if !request.stream {
-            return self.handle_non_streaming_response(response, tx).await;
+            return self.handle_non_streaming_response(response, tx, started).await;
         }
 
         let mut stream = response.bytes_stream();
@@ -168,6 +186,7 @@ impl Provider for OpenAiProvider {
         let mut tool_calls: HashMap<u32, PendingToolCall> = HashMap::new();
         let mut full_content = String::new();
         let mut usage: Option<Usage> = None;
+        let mut saw_first_chunk = false;
 
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
@@ -175,11 +194,19 @@ impl Provider for OpenAiProvider {
             }
 
             let chunk = chunk.map_err(|e| AgentError::Stream(e.to_string()))?;
+            if !saw_first_chunk {
+                saw_first_chunk = true;
+                log::debug!(
+                    "[agentive::openai] first stream chunk elapsed={}ms bytes={}",
+                    started.elapsed().as_millis(),
+                    chunk.len()
+                );
+            }
             let data_lines = parser.feed(&chunk);
 
             for data in data_lines {
                 if data == "[DONE]" {
-                    let final_tool_calls = if tool_calls.is_empty() {
+                    let final_tool_calls: Option<Vec<ToolCall>> = if tool_calls.is_empty() {
                         None
                     } else {
                         let mut calls: Vec<_> = tool_calls.drain().collect();
@@ -192,6 +219,10 @@ impl Provider for OpenAiProvider {
                         )
                     };
 
+                    let tool_call_count = final_tool_calls
+                        .as_ref()
+                        .map(|calls| calls.len())
+                        .unwrap_or(0);
                     let message = if let Some(calls) = final_tool_calls {
                         let mut msg = ChatMessage::assistant_with_tool_calls(calls);
                         if !full_content.is_empty() {
@@ -207,6 +238,12 @@ impl Provider for OpenAiProvider {
                             response: ChatResponse { message, usage },
                         })
                         .await;
+                    log::debug!(
+                        "[agentive::openai] stream done elapsed={}ms response_chars={} tool_calls={}",
+                        started.elapsed().as_millis(),
+                        full_content.chars().count(),
+                        tool_call_count
+                    );
                     return Ok(());
                 }
 
@@ -297,6 +334,11 @@ impl Provider for OpenAiProvider {
             }
         }
 
+        log::warn!(
+            "[agentive::openai] stream ended without done elapsed={}ms response_chars={}",
+            started.elapsed().as_millis(),
+            full_content.chars().count()
+        );
         Err(AgentError::Stream("Stream ended without [DONE]".into()))
     }
 
@@ -318,6 +360,7 @@ impl OpenAiProvider {
         &self,
         response: reqwest::Response,
         tx: mpsc::Sender<ChatEvent>,
+        started: Instant,
     ) -> Result<(), AgentError> {
         let parsed: serde_json::Value = response.json().await?;
         let usage = parsed
@@ -342,6 +385,18 @@ impl OpenAiProvider {
                 response: ChatResponse { message, usage },
             })
             .await;
+        log::debug!(
+            "[agentive::openai] non-streaming done elapsed={}ms response_chars={}",
+            started.elapsed().as_millis(),
+            parsed
+                .get("choices")
+                .and_then(|choices| choices.get(0))
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_str())
+                .map(|content| content.chars().count())
+                .unwrap_or(0)
+        );
         Ok(())
     }
 }
