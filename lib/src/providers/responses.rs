@@ -122,6 +122,7 @@ impl ResponsesProvider {
             match msg.role.as_str() {
                 "system" => {
                     input.push(serde_json::json!({
+                        "type": "message",
                         "role": "developer",
                         "content": msg.text().unwrap_or("")
                     }));
@@ -129,6 +130,7 @@ impl ResponsesProvider {
                 "user" => match &msg.content {
                     Some(MessageContent::Text(text)) => {
                         input.push(serde_json::json!({
+                            "type": "message",
                             "role": "user",
                             "content": text
                         }));
@@ -152,6 +154,7 @@ impl ResponsesProvider {
                             })
                             .collect();
                         input.push(serde_json::json!({
+                            "type": "message",
                             "role": "user",
                             "content": content
                         }));
@@ -718,8 +721,10 @@ mod tests {
         let input = provider.messages_to_input(&messages);
 
         assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "developer");
         assert_eq!(input[0]["content"], "You are helpful");
+        assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "user");
         assert_eq!(input[1]["content"], "Hello");
     }
@@ -745,6 +750,7 @@ mod tests {
 
         assert_eq!(input.len(), 3);
         // User message
+        assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "user");
         // Tool call → function_call item
         assert_eq!(input[1]["type"], "function_call");
@@ -854,6 +860,7 @@ mod tests {
 
         let input = provider.messages_to_input(&[msg]);
         assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "user");
 
         let content = input[0]["content"].as_array().unwrap();
@@ -951,7 +958,7 @@ mod tests {
     fn test_body_exceeds_limit_compacts() {
         // Use a very small limit to force compaction
         let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
-            .with_max_request_bytes(300);
+            .with_max_request_bytes(325);
 
         let messages = vec![
             ChatMessage::system("System prompt"),
@@ -981,7 +988,7 @@ mod tests {
     #[test]
     fn test_body_compaction_preserves_system_messages() {
         let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
-            .with_max_request_bytes(400);
+            .with_max_request_bytes(425);
 
         let messages = vec![
             ChatMessage::system("Important system prompt"),
