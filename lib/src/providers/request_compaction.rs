@@ -82,10 +82,3 @@ pub(super) fn compact_items_to_request_limit<T>(
     Ok(compacted)
 }
 
-pub(super) fn remove_single_item<T>(items: &mut Vec<T>, idx: usize) -> usize {
-    if idx >= items.len() {
-        return 0;
-    }
-    items.remove(idx);
-    1
-}

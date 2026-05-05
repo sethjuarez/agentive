@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
-use crate::providers::request_compaction::{compact_items_to_request_limit, remove_single_item};
+use crate::providers::request_compaction::compact_items_to_request_limit;
 use crate::providers::sse::SseParser;
 use crate::types::*;
 
@@ -200,9 +200,56 @@ impl AnthropicProvider {
             "message",
             make_body,
             |_| false,
-            remove_single_item,
+            remove_anthropic_message_group,
         )
     }
+}
+
+fn remove_anthropic_message_group(messages: &mut Vec<serde_json::Value>, idx: usize) -> usize {
+    if idx >= messages.len() {
+        return 0;
+    }
+
+    let removed = messages.remove(idx);
+    let mut dropped = 1usize;
+    let tool_use_ids = removed
+        .get("content")
+        .and_then(|content| content.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(|kind| kind.as_str()) == Some("tool_use"))
+        .filter_map(|part| part.get("id").and_then(|id| id.as_str()))
+        .map(String::from)
+        .collect::<std::collections::HashSet<_>>();
+
+    if tool_use_ids.is_empty() {
+        return dropped;
+    }
+
+    while idx < messages.len() && anthropic_tool_result_matches(&messages[idx], &tool_use_ids) {
+        messages.remove(idx);
+        dropped += 1;
+    }
+
+    dropped
+}
+
+fn anthropic_tool_result_matches(
+    message: &serde_json::Value,
+    tool_use_ids: &std::collections::HashSet<String>,
+) -> bool {
+    message
+        .get("content")
+        .and_then(|content| content.as_array())
+        .into_iter()
+        .flatten()
+        .any(|part| {
+            part.get("type").and_then(|kind| kind.as_str()) == Some("tool_result")
+                && part
+                    .get("tool_use_id")
+                    .and_then(|id| id.as_str())
+                    .is_some_and(|id| tool_use_ids.contains(id))
+        })
 }
 
 #[async_trait::async_trait]
@@ -624,5 +671,39 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "old answer");
         assert_eq!(messages[1]["content"], "recent question");
+    }
+
+    #[test]
+    fn test_build_body_within_limit_drops_tool_use_group() {
+        let provider =
+            AnthropicProvider::new("key", "claude-sonnet-4-20250514").with_max_request_bytes(500);
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "toolu_old".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"old.txt\"}".into(),
+                    },
+                }]),
+                ChatMessage::tool_result("toolu_old", &"old tool output ".repeat(60)),
+                ChatMessage::user("recent question"),
+            ],
+            model: "claude-sonnet-4-20250514".into(),
+            tools: None,
+            stream: true,
+            response_format: None,
+        };
+        let (system, mut messages, tools) = provider.prepare_request(&request);
+
+        let body = provider
+            .build_body_within_limit(&mut messages, &system, &tools)
+            .unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert!(serialized.len() <= 500);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "recent question");
     }
 }
