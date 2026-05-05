@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
+use crate::providers::request_compaction::{compact_items_to_request_limit, remove_single_item};
 use crate::providers::sse::SseParser;
 use crate::types::*;
 
@@ -22,6 +23,7 @@ pub struct AnthropicProvider {
     model: String,
     client: Client,
     context_budget: usize,
+    max_request_bytes: usize,
 }
 
 impl AnthropicProvider {
@@ -31,12 +33,22 @@ impl AnthropicProvider {
             model: model.to_string(),
             client: Client::new(),
             context_budget: 200_000,
+            max_request_bytes: usize::MAX,
         }
     }
 
     /// Set the context budget in characters.
     pub fn with_context_budget(mut self, chars: usize) -> Self {
         self.context_budget = chars;
+        self
+    }
+
+    /// Set the maximum serialized request body size in bytes.
+    ///
+    /// Anthropic does not default to a provider-specific byte cap, but callers
+    /// can opt in to the same shared request compaction used by other providers.
+    pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes;
         self
     }
 
@@ -156,6 +168,41 @@ impl AnthropicProvider {
 
         (system_prompt, messages, tools)
     }
+
+    fn build_body_within_limit(
+        &self,
+        messages: &mut Vec<serde_json::Value>,
+        system_prompt: &Option<String>,
+        tools: &Option<Vec<serde_json::Value>>,
+    ) -> Result<serde_json::Value, AgentError> {
+        let make_body = |messages: &[serde_json::Value]| -> Result<serde_json::Value, AgentError> {
+            let mut body = serde_json::json!({
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": 4096,
+                "stream": true,
+            });
+
+            if let Some(sys) = system_prompt {
+                body["system"] = serde_json::json!(sys);
+            }
+            if let Some(t) = tools {
+                body["tools"] = serde_json::json!(t);
+            }
+
+            Ok(body)
+        };
+
+        compact_items_to_request_limit(
+            messages,
+            self.max_request_bytes,
+            "Anthropic",
+            "message",
+            make_body,
+            |_| false,
+            remove_single_item,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -166,21 +213,8 @@ impl Provider for AnthropicProvider {
         tx: mpsc::Sender<ChatEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        let (system_prompt, messages, tools) = self.prepare_request(&request);
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": 4096,
-            "stream": true,
-        });
-
-        if let Some(sys) = &system_prompt {
-            body["system"] = serde_json::json!(sys);
-        }
-        if let Some(t) = &tools {
-            body["tools"] = serde_json::json!(t);
-        }
+        let (system_prompt, mut messages, tools) = self.prepare_request(&request);
+        let body = self.build_body_within_limit(&mut messages, &system_prompt, &tools)?;
 
         let response = self
             .client
@@ -224,15 +258,11 @@ impl Provider for AnthropicProvider {
                     Err(_) => continue,
                 };
 
-                let event_type = parsed
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
                 match event_type {
                     "message_start" => {
-                        if let Some(usage_obj) =
-                            parsed.get("message").and_then(|m| m.get("usage"))
+                        if let Some(usage_obj) = parsed.get("message").and_then(|m| m.get("usage"))
                         {
                             input_usage = usage_obj
                                 .get("input_tokens")
@@ -242,10 +272,8 @@ impl Provider for AnthropicProvider {
                     }
                     "content_block_start" => {
                         if let Some(block) = parsed.get("content_block") {
-                            let block_type = block
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("text");
+                            let block_type =
+                                block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
 
                             if block_type == "tool_use" {
                                 let id = block
@@ -287,9 +315,7 @@ impl Provider for AnthropicProvider {
 
                             match delta_type {
                                 "text_delta" => {
-                                    if let Some(text) =
-                                        delta.get("text").and_then(|t| t.as_str())
-                                    {
+                                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                                         full_content.push_str(text);
                                         let _ = tx
                                             .send(ChatEvent::Token {
@@ -568,5 +594,35 @@ mod tests {
         assert_eq!(tools[0]["name"], "read_file");
         assert_eq!(tools[0]["description"], "Reads a file");
         assert!(tools[0]["input_schema"].is_object());
+    }
+
+    #[test]
+    fn test_build_body_within_limit_opt_in_compacts_messages() {
+        let provider =
+            AnthropicProvider::new("key", "claude-sonnet-4-20250514").with_max_request_bytes(350);
+        let request = ChatRequest {
+            messages: vec![
+                ChatMessage::system("Important system prompt"),
+                ChatMessage::user(&"old ".repeat(100)),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("recent question"),
+            ],
+            model: "claude-sonnet-4-20250514".into(),
+            tools: None,
+            stream: true,
+            response_format: None,
+        };
+        let (system, mut messages, tools) = provider.prepare_request(&request);
+
+        let body = provider
+            .build_body_within_limit(&mut messages, &system, &tools)
+            .unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert!(serialized.len() <= 350);
+        assert_eq!(body["system"], "Important system prompt");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "old answer");
+        assert_eq!(messages[1]["content"], "recent question");
     }
 }

@@ -3,7 +3,7 @@
 //! Supports OpenAI, Azure OpenAI, Microsoft Foundry, and any endpoint
 //! that implements the `/chat/completions` SSE streaming protocol.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use futures_util::StreamExt;
@@ -14,6 +14,10 @@ use crate::auth::AuthStrategy;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
+use crate::providers::request_compaction::{
+    compact_items_to_request_limit, default_azure_max_request_bytes,
+    DEFAULT_AZURE_MAX_REQUEST_BYTES,
+};
 use crate::providers::sse::SseParser;
 use crate::types::*;
 
@@ -28,6 +32,7 @@ pub struct OpenAiProvider {
     client: Client,
     context_budget: usize,
     vision: bool,
+    max_request_bytes: usize,
 }
 
 impl OpenAiProvider {
@@ -50,6 +55,7 @@ impl OpenAiProvider {
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
+            max_request_bytes: default_azure_max_request_bytes(trimmed),
         }
     }
 
@@ -69,13 +75,15 @@ impl OpenAiProvider {
     /// );
     /// ```
     pub fn with_auth(endpoint: &str, auth: AuthStrategy, model: &str) -> Self {
+        let trimmed = endpoint.trim_end_matches('/');
         Self {
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint: trimmed.to_string(),
             auth,
             model: model.to_string(),
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
+            max_request_bytes: default_azure_max_request_bytes(trimmed),
         }
     }
 
@@ -88,6 +96,17 @@ impl OpenAiProvider {
     /// Enable vision support.
     pub fn with_vision(mut self, enabled: bool) -> Self {
         self.vision = enabled;
+        self
+    }
+
+    /// Set the maximum serialized request body size in bytes.
+    ///
+    /// Azure OpenAI-compatible gateways can truncate request bodies around
+    /// ~79KB, causing misleading 400 JSON parse errors. Azure endpoints default
+    /// to 64KB; non-Azure endpoints default to no byte cap. Set to
+    /// `usize::MAX` to disable the guard.
+    pub fn with_max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes;
         self
     }
 
@@ -117,6 +136,47 @@ impl OpenAiProvider {
             format!("{}/chat/completions", self.endpoint)
         }
     }
+
+    /// Build the JSON request body, compacting older conversation messages if
+    /// the serialized size exceeds `max_request_bytes`.
+    fn build_body_within_limit(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        tools: &Option<Vec<Tool>>,
+        stream: bool,
+        response_format: &Option<ResponseFormat>,
+    ) -> Result<serde_json::Value, AgentError> {
+        let make_body = |messages: &[ChatMessage]| -> Result<serde_json::Value, AgentError> {
+            let mut body = serde_json::json!({
+                "model": self.model,
+                "messages": messages,
+                "stream": stream,
+                "tools": tools,
+            });
+
+            if stream {
+                body["stream_options"] = serde_json::json!({"include_usage": true});
+            }
+
+            if let Some(rf) = response_format {
+                body["response_format"] = serde_json::to_value(rf).map_err(|e| {
+                    AgentError::Stream(format!("Failed to serialize response_format: {e}"))
+                })?;
+            }
+
+            Ok(body)
+        };
+
+        compact_items_to_request_limit(
+            messages,
+            self.max_request_bytes,
+            "OpenAI chat",
+            "message",
+            make_body,
+            |message| is_preserved_prefix_role(&message.role),
+            remove_message_group,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -127,27 +187,16 @@ impl Provider for OpenAiProvider {
         tx: mpsc::Sender<ChatEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": request.messages,
-            "stream": request.stream,
-            "tools": request.tools,
-        });
-
-        if request.stream {
-            body["stream_options"] = serde_json::json!({"include_usage": true});
-        }
-
-        // Add response_format if specified
-        if let Some(ref rf) = request.response_format {
-            body["response_format"] = serde_json::to_value(rf)
-                .map_err(|e| AgentError::Stream(format!("Failed to serialize response_format: {}", e)))?;
-        }
+        let stream = request.stream;
+        let tools = request.tools;
+        let response_format = request.response_format;
+        let mut messages = request.messages;
+        let body = self.build_body_within_limit(&mut messages, &tools, stream, &response_format)?;
 
         let started = Instant::now();
         log::debug!(
             "[agentive::openai] request start stream={} model={}",
-            request.stream,
+            stream,
             self.model
         );
 
@@ -175,8 +224,10 @@ impl Provider for OpenAiProvider {
             });
         }
 
-        if !request.stream {
-            return self.handle_non_streaming_response(response, tx, started).await;
+        if !stream {
+            return self
+                .handle_non_streaming_response(response, tx, started)
+                .await;
         }
 
         let mut stream = response.bytes_stream();
@@ -279,10 +330,7 @@ impl Provider for OpenAiProvider {
                 }
 
                 // Reasoning/thinking tokens (OpenAI o-series)
-                if let Some(thinking) = delta
-                    .get("reasoning_content")
-                    .and_then(|c| c.as_str())
-                {
+                if let Some(thinking) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                     if !thinking.is_empty() {
                         let _ = tx
                             .send(ChatEvent::Thinking {
@@ -295,17 +343,13 @@ impl Provider for OpenAiProvider {
                 // Tool call deltas — accumulate by index
                 if let Some(tc_array) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tc_array {
-                        let index =
-                            tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
 
-                        let entry =
-                            tool_calls
-                                .entry(index)
-                                .or_insert_with(|| PendingToolCall {
-                                    id: String::new(),
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                });
+                        let entry = tool_calls.entry(index).or_insert_with(|| PendingToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        });
 
                         if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                             entry.id = id.to_string();
@@ -402,6 +446,42 @@ impl OpenAiProvider {
 }
 
 // -- Helpers -----------------------------------------------------------------
+
+fn is_preserved_prefix_role(role: &str) -> bool {
+    matches!(role, "system" | "developer")
+}
+
+fn remove_message_group(messages: &mut Vec<ChatMessage>, idx: usize) -> usize {
+    if idx >= messages.len() {
+        return 0;
+    }
+
+    let removed = messages.remove(idx);
+    let mut count = 1usize;
+
+    if removed.role == "assistant" {
+        let call_ids = removed
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|call| call.id)
+            .collect::<HashSet<_>>();
+
+        while !call_ids.is_empty()
+            && idx < messages.len()
+            && messages[idx].role == "tool"
+            && messages[idx]
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| call_ids.contains(id))
+        {
+            messages.remove(idx);
+            count += 1;
+        }
+    }
+
+    count
+}
 
 fn parse_chat_completion_message(value: &serde_json::Value) -> Result<ChatMessage, AgentError> {
     let role = value
@@ -522,6 +602,89 @@ mod tests {
     }
 
     #[test]
+    fn test_request_size_guard_defaults_to_azure_only() {
+        let azure = OpenAiProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
+        assert_eq!(azure.max_request_bytes, DEFAULT_AZURE_MAX_REQUEST_BYTES);
+
+        let openai = OpenAiProvider::new("https://api.openai.com/v1", "key", "gpt-4o");
+        assert_eq!(openai.max_request_bytes, usize::MAX);
+    }
+
+    #[test]
+    fn test_build_body_within_limit_drops_oldest_messages() {
+        let provider = OpenAiProvider::new("https://api.openai.com/v1", "key", "gpt-4o")
+            .with_max_request_bytes(900);
+        let mut messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user(&"old user ".repeat(80)),
+            ChatMessage::assistant("old assistant"),
+            ChatMessage::user("recent question"),
+            ChatMessage::assistant("recent answer"),
+        ];
+
+        let body = provider
+            .build_body_within_limit(&mut messages, &None, true, &None)
+            .unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert!(serialized.len() <= 900);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].text(), Some("old assistant"));
+        assert_eq!(messages[2].text(), Some("recent question"));
+        assert_eq!(messages[3].text(), Some("recent answer"));
+    }
+
+    #[test]
+    fn test_build_body_within_limit_drops_tool_call_group() {
+        let provider = OpenAiProvider::new("https://api.openai.com/v1", "key", "gpt-4o")
+            .with_max_request_bytes(1_300);
+        let mut messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                id: "call_old".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"old.txt"}"#.into(),
+                },
+            }]),
+            ChatMessage::tool_result("call_old", &"old tool output ".repeat(80)),
+            ChatMessage::user("recent question"),
+            ChatMessage::assistant("recent answer"),
+        ];
+
+        let body = provider
+            .build_body_within_limit(&mut messages, &None, true, &None)
+            .unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert!(serialized.len() <= 1_300);
+        assert_eq!(
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            ["system", "user", "assistant"]
+        );
+        assert_eq!(messages[1].text(), Some("recent question"));
+    }
+
+    #[test]
+    fn test_build_body_within_limit_errors_when_prefix_is_too_large() {
+        let provider = OpenAiProvider::new("https://api.openai.com/v1", "key", "gpt-4o")
+            .with_max_request_bytes(100);
+        let mut messages = vec![
+            ChatMessage::system(&"large system ".repeat(40)),
+            ChatMessage::user("recent question"),
+            ChatMessage::assistant("recent answer"),
+        ];
+
+        let err = provider
+            .build_body_within_limit(&mut messages, &None, true, &None)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("too large after compaction"));
+    }
+
+    #[test]
     fn test_with_auth_explicit() {
         use std::sync::Arc;
         let p = OpenAiProvider::with_auth(
@@ -536,19 +699,17 @@ mod tests {
     fn test_builder_methods() {
         let p = OpenAiProvider::new("https://api.openai.com/v1", "key", "gpt-4o")
             .with_context_budget(100_000)
-            .with_vision(true);
+            .with_vision(true)
+            .with_max_request_bytes(1_024);
         assert_eq!(p.context_budget_chars(), 100_000);
         assert!(p.supports_vision());
+        assert_eq!(p.max_request_bytes, 1_024);
     }
 
     #[test]
     fn test_chat_url_plain_azure() {
         // Plain Azure OpenAI endpoint (not Foundry) uses deployment-based URL
-        let p = OpenAiProvider::new(
-            "https://my-resource.openai.azure.com",
-            "key",
-            "gpt-4o",
-        );
+        let p = OpenAiProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
         assert_eq!(
             p.chat_url(),
             "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
@@ -558,11 +719,7 @@ mod tests {
     #[test]
     fn test_chat_url_azure_services() {
         // Azure AI Services endpoint (not Foundry project, no /api/projects/)
-        let p = OpenAiProvider::new(
-            "https://my-resource.services.ai.azure.com",
-            "key",
-            "gpt-4o",
-        );
+        let p = OpenAiProvider::new("https://my-resource.services.ai.azure.com", "key", "gpt-4o");
         assert_eq!(
             p.chat_url(),
             "https://my-resource.services.ai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
@@ -695,8 +852,10 @@ mod tests {
                 if data == "[DONE]" {
                     let mut calls: Vec<_> = tool_calls.drain().collect();
                     calls.sort_by_key(|(idx, _)| *idx);
-                    let final_calls: Vec<ToolCall> =
-                        calls.into_iter().map(|(_, tc)| tc.into_tool_call()).collect();
+                    let final_calls: Vec<ToolCall> = calls
+                        .into_iter()
+                        .map(|(_, tc)| tc.into_tool_call())
+                        .collect();
                     let msg = ChatMessage::assistant_with_tool_calls(final_calls);
                     let _ = tx
                         .send(ChatEvent::Done {
@@ -713,14 +872,11 @@ mod tests {
                 if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
                     for tc in tc_array {
                         let index = tc["index"].as_u64().unwrap_or(0) as u32;
-                        let entry =
-                            tool_calls
-                                .entry(index)
-                                .or_insert_with(|| PendingToolCall {
-                                    id: String::new(),
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                });
+                        let entry = tool_calls.entry(index).or_insert_with(|| PendingToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        });
                         if let Some(id) = tc["id"].as_str() {
                             entry.id = id.to_string();
                         }

@@ -18,6 +18,9 @@ use crate::auth::AuthStrategy;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
+use crate::providers::request_compaction::{
+    compact_items_to_request_limit, DEFAULT_AZURE_MAX_REQUEST_BYTES,
+};
 use crate::providers::sse::SseParser;
 use crate::types::*;
 
@@ -43,9 +46,6 @@ pub struct ResponsesProvider {
     max_request_bytes: usize,
 }
 
-/// Default max request body size (64KB) — safely below the ~79KB Azure limit.
-const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
-
 impl ResponsesProvider {
     /// Create a new Responses API provider.
     ///
@@ -66,7 +66,7 @@ impl ResponsesProvider {
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
-            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            max_request_bytes: DEFAULT_AZURE_MAX_REQUEST_BYTES,
         }
     }
 
@@ -79,7 +79,7 @@ impl ResponsesProvider {
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
-            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            max_request_bytes: DEFAULT_AZURE_MAX_REQUEST_BYTES,
         }
     }
 
@@ -125,40 +125,38 @@ impl ResponsesProvider {
                         "content": msg.text().unwrap_or("")
                     }));
                 }
-                "user" => {
-                    match &msg.content {
-                        Some(MessageContent::Text(text)) => {
-                            input.push(serde_json::json!({
-                                "role": "user",
-                                "content": text
-                            }));
-                        }
-                        Some(MessageContent::Parts(parts)) => {
-                            let content: Vec<serde_json::Value> = parts
-                                .iter()
-                                .map(|p| match p {
-                                    ContentPart::Text { text } => {
-                                        serde_json::json!({
-                                            "type": "input_text",
-                                            "text": text
-                                        })
-                                    }
-                                    ContentPart::ImageUrl { image_url } => {
-                                        serde_json::json!({
-                                            "type": "input_image",
-                                            "image_url": image_url.url
-                                        })
-                                    }
-                                })
-                                .collect();
-                            input.push(serde_json::json!({
-                                "role": "user",
-                                "content": content
-                            }));
-                        }
-                        None => {}
+                "user" => match &msg.content {
+                    Some(MessageContent::Text(text)) => {
+                        input.push(serde_json::json!({
+                            "role": "user",
+                            "content": text
+                        }));
                     }
-                }
+                    Some(MessageContent::Parts(parts)) => {
+                        let content: Vec<serde_json::Value> = parts
+                            .iter()
+                            .map(|p| match p {
+                                ContentPart::Text { text } => {
+                                    serde_json::json!({
+                                        "type": "input_text",
+                                        "text": text
+                                    })
+                                }
+                                ContentPart::ImageUrl { image_url } => {
+                                    serde_json::json!({
+                                        "type": "input_image",
+                                        "image_url": image_url.url
+                                    })
+                                }
+                            })
+                            .collect();
+                        input.push(serde_json::json!({
+                            "role": "user",
+                            "content": content
+                        }));
+                    }
+                    None => {}
+                },
                 "assistant" => {
                     // Text content as message item
                     if let Some(text) = msg.text() {
@@ -239,67 +237,46 @@ impl ResponsesProvider {
             b
         };
 
-        let body = make_body(input);
-        let serialized = serde_json::to_string(&body)
-            .map_err(|e| AgentError::Stream(format!("Failed to serialize request: {e}")))?;
-
-        if serialized.len() <= self.max_request_bytes {
-            return Ok(body);
-        }
-
-        // Body too large — drop oldest non-system input items.
-        // Skip system/developer messages at the front.
-        let sys_end = input
-            .iter()
-            .position(|item| {
-                item.get("role")
-                    .and_then(|r| r.as_str())
-                    .map(|r| r != "system" && r != "developer")
-                    .unwrap_or(true)
-            })
-            .unwrap_or(input.len());
-
-        let mut dropped = 0;
-        while input.len() > sys_end + 2 {
-            let trial = make_body(input);
-            let size = serde_json::to_string(&trial)
-                .map(|s| s.len())
-                .unwrap_or(usize::MAX);
-            if size <= self.max_request_bytes {
-                break;
-            }
-
-            // Remove the first conversation item (after system prefix)
-            let removed = input.remove(sys_end);
-            dropped += 1;
-
-            // If we removed a function_call item, also remove its matching
-            // function_call_output items to avoid orphaned tool results
-            if removed.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                if let Some(call_id) = removed.get("call_id").and_then(|c| c.as_str()) {
-                    while input.len() > sys_end
-                        && input[sys_end].get("type").and_then(|t| t.as_str())
-                            == Some("function_call_output")
-                        && input[sys_end].get("call_id").and_then(|c| c.as_str())
-                            == Some(call_id)
-                    {
-                        input.remove(sys_end);
-                        dropped += 1;
-                    }
-                }
-            }
-        }
-
-        if dropped > 0 {
-            log::warn!(
-                "[agentive] Responses body exceeded {}KB — dropped {} input items to fit",
-                self.max_request_bytes / 1024,
-                dropped
-            );
-        }
-
-        Ok(make_body(input))
+        compact_items_to_request_limit(
+            input,
+            self.max_request_bytes,
+            "Responses",
+            "input item",
+            |input| Ok(make_body(input)),
+            is_preserved_response_prefix_item,
+            remove_response_input_group,
+        )
     }
+}
+
+fn is_preserved_response_prefix_item(item: &serde_json::Value) -> bool {
+    item.get("role")
+        .and_then(|r| r.as_str())
+        .map(|r| r == "system" || r == "developer")
+        .unwrap_or(false)
+}
+
+fn remove_response_input_group(input: &mut Vec<serde_json::Value>, idx: usize) -> usize {
+    if idx >= input.len() {
+        return 0;
+    }
+
+    let removed = input.remove(idx);
+    let mut dropped = 1usize;
+
+    if removed.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+        if let Some(call_id) = removed.get("call_id").and_then(|c| c.as_str()) {
+            while idx < input.len()
+                && input[idx].get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+                && input[idx].get("call_id").and_then(|c| c.as_str()) == Some(call_id)
+            {
+                input.remove(idx);
+                dropped += 1;
+            }
+        }
+    }
+
+    dropped
 }
 
 #[async_trait::async_trait]
@@ -413,12 +390,9 @@ impl Provider for ResponsesProvider {
                     "response.output_item.added" => {
                         let item = &parsed["item"];
                         if item["type"].as_str() == Some("function_call") {
-                            let output_index =
-                                parsed["output_index"].as_u64().unwrap_or(0) as u32;
-                            let call_id =
-                                item["call_id"].as_str().unwrap_or("").to_string();
-                            let name =
-                                item["name"].as_str().unwrap_or("").to_string();
+                            let output_index = parsed["output_index"].as_u64().unwrap_or(0) as u32;
+                            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
+                            let name = item["name"].as_str().unwrap_or("").to_string();
 
                             pending_tool_calls.insert(
                                 output_index,
@@ -444,8 +418,7 @@ impl Provider for ResponsesProvider {
                         }
                     }
                     "response.function_call_arguments.delta" => {
-                        let output_index =
-                            parsed["output_index"].as_u64().unwrap_or(0) as u32;
+                        let output_index = parsed["output_index"].as_u64().unwrap_or(0) as u32;
                         if let Some(delta) = parsed["delta"].as_str() {
                             if let Some(tc) = pending_tool_calls.get_mut(&output_index) {
                                 tc.arguments.push_str(delta);
@@ -455,9 +428,13 @@ impl Provider for ResponsesProvider {
                     "response.completed" => {
                         got_completed = true;
                         // Extract usage if present
-                        if let Some(resp_usage) = parsed.get("response").and_then(|r| r.get("usage")) {
-                            let input_tokens = resp_usage["input_tokens"].as_u64().unwrap_or(0) as u32;
-                            let output_tokens = resp_usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+                        if let Some(resp_usage) =
+                            parsed.get("response").and_then(|r| r.get("usage"))
+                        {
+                            let input_tokens =
+                                resp_usage["input_tokens"].as_u64().unwrap_or(0) as u32;
+                            let output_tokens =
+                                resp_usage["output_tokens"].as_u64().unwrap_or(0) as u32;
                             usage = Some(Usage {
                                 prompt_tokens: input_tokens,
                                 completion_tokens: output_tokens,
@@ -577,8 +554,14 @@ async fn handle_non_streaming_response(
 }
 
 fn parse_responses_usage(value: &serde_json::Value) -> Result<Usage, AgentError> {
-    let input_tokens = value.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let output_tokens = value.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let input_tokens = value
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     Ok(Usage {
         prompt_tokens: input_tokens,
         completion_tokens: output_tokens,
@@ -735,11 +718,7 @@ mod tests {
 
     #[test]
     fn test_responses_url_azure() {
-        let p = ResponsesProvider::new(
-            "https://my-resource.openai.azure.com",
-            "key",
-            "gpt-4o",
-        );
+        let p = ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
         assert_eq!(
             p.responses_url(),
             "https://my-resource.openai.azure.com/openai/v1/responses"
@@ -834,7 +813,9 @@ mod tests {
             ChatMessage::user("Hello"),
         ];
         let mut input = provider.messages_to_input(&messages);
-        let body = provider.build_body_within_limit(&mut input, &None, true).unwrap();
+        let body = provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
 
         // Small body should pass through unchanged
         assert_eq!(input.len(), 2);
@@ -847,7 +828,9 @@ mod tests {
         let messages = vec![ChatMessage::user("Hello")];
         let mut input = provider.messages_to_input(&messages);
 
-        let body = provider.build_body_within_limit(&mut input, &None, false).unwrap();
+        let body = provider
+            .build_body_within_limit(&mut input, &None, false)
+            .unwrap();
 
         assert_eq!(body["stream"], false);
     }
@@ -887,7 +870,7 @@ mod tests {
     fn test_body_exceeds_limit_compacts() {
         // Use a very small limit to force compaction
         let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
-            .with_max_request_bytes(200);
+            .with_max_request_bytes(300);
 
         let messages = vec![
             ChatMessage::system("System prompt"),
@@ -898,22 +881,26 @@ mod tests {
         let mut input = provider.messages_to_input(&messages);
         let original_len = input.len();
 
-        let body = provider.build_body_within_limit(&mut input, &None, true).unwrap();
+        let body = provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
 
         // Should have dropped some items
         let final_len = body.get("input").unwrap().as_array().unwrap().len();
-        assert!(final_len < original_len, "Expected compaction: {} < {}", final_len, original_len);
-        // System/developer message should be preserved
-        assert_eq!(
-            body["input"][0]["role"].as_str().unwrap(),
-            "developer"
+        assert!(
+            final_len < original_len,
+            "Expected compaction: {} < {}",
+            final_len,
+            original_len
         );
+        // System/developer message should be preserved
+        assert_eq!(body["input"][0]["role"].as_str().unwrap(), "developer");
     }
 
     #[test]
     fn test_body_compaction_preserves_system_messages() {
         let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
-            .with_max_request_bytes(300);
+            .with_max_request_bytes(400);
 
         let messages = vec![
             ChatMessage::system("Important system prompt"),
@@ -921,7 +908,9 @@ mod tests {
             ChatMessage::user("Short"),
         ];
         let mut input = provider.messages_to_input(&messages);
-        let _ = provider.build_body_within_limit(&mut input, &None, true).unwrap();
+        let _ = provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
 
         // Developer (system) message should never be dropped
         assert!(input[0].get("role").unwrap().as_str().unwrap() == "developer");
@@ -940,7 +929,9 @@ mod tests {
             serde_json::json!({"role": "user", "content": "ok"}),
         ];
 
-        let _ = provider.build_body_within_limit(&mut input, &None, true).unwrap();
+        let _ = provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
 
         // The function_call + its output should be dropped together
         // No orphaned function_call_output should remain
@@ -969,7 +960,9 @@ mod tests {
             ChatMessage::user(&"A".repeat(100_000)),
         ];
         let mut input = provider.messages_to_input(&messages);
-        let body = provider.build_body_within_limit(&mut input, &None, true).unwrap();
+        let body = provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
 
         // With max disabled, no compaction should occur
         assert_eq!(body["input"].as_array().unwrap().len(), 2);
