@@ -19,7 +19,7 @@ use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
 use crate::providers::request_compaction::{
-    compact_items_to_request_limit, DEFAULT_AZURE_MAX_REQUEST_BYTES,
+    compact_items_to_request_limit, default_azure_max_request_bytes,
 };
 use crate::providers::sse::SseParser;
 use crate::types::*;
@@ -66,20 +66,21 @@ impl ResponsesProvider {
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
-            max_request_bytes: DEFAULT_AZURE_MAX_REQUEST_BYTES,
+            max_request_bytes: default_azure_max_request_bytes(trimmed),
         }
     }
 
     /// Create a provider with an explicit auth strategy.
     pub fn with_auth(endpoint: &str, auth: AuthStrategy, model: &str) -> Self {
+        let trimmed = endpoint.trim_end_matches('/');
         Self {
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            endpoint: trimmed.to_string(),
             auth,
             model: model.to_string(),
             client: Client::new(),
             context_budget: 200_000,
             vision: false,
-            max_request_bytes: DEFAULT_AZURE_MAX_REQUEST_BYTES,
+            max_request_bytes: default_azure_max_request_bytes(trimmed),
         }
     }
 
@@ -271,18 +272,53 @@ fn remove_response_input_group(input: &mut Vec<serde_json::Value>, idx: usize) -
     let removed = input.remove(idx);
     let mut dropped = 1usize;
 
-    if removed.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-        if let Some(call_id) = removed.get("call_id").and_then(|c| c.as_str()) {
-            while idx < input.len()
-                && input[idx].get("type").and_then(|t| t.as_str()) == Some("function_call_output")
-                && input[idx].get("call_id").and_then(|c| c.as_str()) == Some(call_id)
-            {
-                input.remove(idx);
-                dropped += 1;
-            }
+    if removed.get("role").and_then(|r| r.as_str()) == Some("user") {
+        while idx < input.len()
+            && input[idx]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .is_none_or(|role| role != "user" && role != "system" && role != "developer")
+        {
+            input.remove(idx);
+            dropped += 1;
         }
+    } else if removed.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+        while idx < input.len()
+            && input[idx].get("type").and_then(|t| t.as_str()) == Some("function_call")
+        {
+            dropped += remove_response_function_call_group(input, idx);
+        }
+    } else if removed.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+        dropped += remove_response_function_call_outputs(input, idx, &removed);
     }
 
+    dropped
+}
+
+fn remove_response_function_call_group(input: &mut Vec<serde_json::Value>, idx: usize) -> usize {
+    if idx >= input.len() {
+        return 0;
+    }
+    let removed = input.remove(idx);
+    1 + remove_response_function_call_outputs(input, idx, &removed)
+}
+
+fn remove_response_function_call_outputs(
+    input: &mut Vec<serde_json::Value>,
+    idx: usize,
+    function_call: &serde_json::Value,
+) -> usize {
+    let Some(call_id) = function_call.get("call_id").and_then(|c| c.as_str()) else {
+        return 0;
+    };
+    let mut dropped = 0usize;
+    while idx < input.len()
+        && input[idx].get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+        && input[idx].get("call_id").and_then(|c| c.as_str()) == Some(call_id)
+    {
+        input.remove(idx);
+        dropped += 1;
+    }
     dropped
 }
 
@@ -755,6 +791,22 @@ mod tests {
     }
 
     #[test]
+    fn test_request_size_guard_defaults_to_azure_only() {
+        let azure = ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
+        assert_eq!(azure.request_budget_bytes(), Some(64 * 1024));
+
+        let openai = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
+        assert_eq!(openai.request_budget_bytes(), None);
+
+        let custom = ResponsesProvider::with_auth(
+            "https://llm.example.test",
+            AuthStrategy::Bearer("token".into()),
+            "gpt-4o",
+        );
+        assert_eq!(custom.request_budget_bytes(), None);
+    }
+
+    #[test]
     fn test_assistant_text_and_tool_calls() {
         let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
 
@@ -977,6 +1029,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_body_compaction_drops_assistant_text_tool_siblings() {
+        let provider = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o")
+            .with_max_request_bytes(350);
+
+        let mut input = vec![
+            serde_json::json!({"role": "developer", "content": "sys"}),
+            serde_json::json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "old text"}]}),
+            serde_json::json!({"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}" }),
+            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "A".repeat(300)}),
+            serde_json::json!({"role": "user", "content": "ok"}),
+        ];
+
+        let _ = provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
+
+        assert!(!input
+            .iter()
+            .any(|item| item.get("call_id").and_then(|id| id.as_str()) == Some("c1")));
+        assert_eq!(input.last().unwrap()["content"], "ok");
     }
 
     #[test]

@@ -47,8 +47,8 @@ pub(super) fn compact_items_to_request_limit<T>(
     while items.len() > preserved_end + 2 {
         let trial = make_body(items)?;
         let size = serde_json::to_string(&trial)
-            .map(|s| s.len())
-            .unwrap_or(usize::MAX);
+            .map_err(|e| AgentError::Stream(format!("Failed to serialize request: {e}")))?
+            .len();
         if size <= max_request_bytes {
             break;
         }
@@ -81,4 +81,3 @@ pub(super) fn compact_items_to_request_limit<T>(
 
     Ok(compacted)
 }
-

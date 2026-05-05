@@ -197,6 +197,16 @@ fn remove_anthropic_message_group(messages: &mut Vec<serde_json::Value>, idx: us
 
     let removed = messages.remove(idx);
     let mut dropped = 1usize;
+    if removed.get("role").and_then(|r| r.as_str()) == Some("user") {
+        while idx < messages.len()
+            && messages[idx].get("role").and_then(|r| r.as_str()) != Some("user")
+        {
+            messages.remove(idx);
+            dropped += 1;
+        }
+        return dropped;
+    }
+
     let tool_use_ids = removed
         .get("content")
         .and_then(|content| content.as_array())
@@ -693,9 +703,8 @@ mod tests {
 
         assert!(serialized.len() <= 350);
         assert_eq!(body["system"], "Important system prompt");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["content"], "old answer");
-        assert_eq!(messages[1]["content"], "recent question");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "recent question");
     }
 
     #[test]

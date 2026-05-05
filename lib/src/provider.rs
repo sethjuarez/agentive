@@ -42,16 +42,11 @@ pub trait Provider: Send + Sync {
 
     /// Estimate the serialized HTTP request body size for this provider.
     ///
-    /// Provider implementations should account for their actual wire format.
-    /// The default estimates the generic `ChatRequest` shape.
-    fn estimate_request_bytes(&self, request: &ChatRequest) -> Result<Option<usize>, AgentError> {
-        if self.request_budget_bytes().is_none() {
-            return Ok(None);
-        }
-
-        serde_json::to_string(request)
-            .map(|body| Some(body.len()))
-            .map_err(AgentError::from)
+    /// Provider implementations that return a request budget must override
+    /// this with their actual wire format. The default opts out to avoid using
+    /// the generic `ChatRequest` shape for providers that serialize differently.
+    fn estimate_request_bytes(&self, _request: &ChatRequest) -> Result<Option<usize>, AgentError> {
+        Ok(None)
     }
 
     /// Whether this provider/model supports vision (image content parts).

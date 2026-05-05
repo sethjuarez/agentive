@@ -487,25 +487,54 @@ fn remove_message_group(messages: &mut Vec<ChatMessage>, idx: usize) -> usize {
     let removed = messages.remove(idx);
     let mut count = 1usize;
 
-    if removed.role == "assistant" {
-        let call_ids = removed
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|call| call.id)
-            .collect::<HashSet<_>>();
-
-        while !call_ids.is_empty()
-            && idx < messages.len()
-            && messages[idx].role == "tool"
-            && messages[idx]
-                .tool_call_id
-                .as_ref()
-                .is_some_and(|id| call_ids.contains(id))
+    if removed.role == "user" {
+        while idx < messages.len()
+            && !matches!(messages[idx].role.as_str(), "user" | "system" | "developer")
         {
             messages.remove(idx);
             count += 1;
         }
+    } else if removed.role == "assistant" {
+        count += remove_matching_tool_results(messages, idx, &removed);
+    }
+
+    while idx < messages.len()
+        && messages[idx].role == "user"
+        && messages[idx]
+            .text()
+            .is_some_and(|text| text.starts_with("[Images from the tool result above"))
+    {
+        messages.remove(idx);
+        count += 1;
+    }
+
+    count
+}
+
+fn remove_matching_tool_results(
+    messages: &mut Vec<ChatMessage>,
+    idx: usize,
+    assistant: &ChatMessage,
+) -> usize {
+    let call_ids = assistant
+        .tool_calls
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|call| call.id.clone())
+        .collect::<HashSet<_>>();
+    let mut count = 0usize;
+
+    while !call_ids.is_empty()
+        && idx < messages.len()
+        && messages[idx].role == "tool"
+        && messages[idx]
+            .tool_call_id
+            .as_ref()
+            .is_some_and(|id| call_ids.contains(id))
+    {
+        messages.remove(idx);
+        count += 1;
     }
 
     count
@@ -656,11 +685,10 @@ mod tests {
         let serialized = serde_json::to_string(&body).unwrap();
 
         assert!(serialized.len() <= 900);
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].text(), Some("old assistant"));
-        assert_eq!(messages[2].text(), Some("recent question"));
-        assert_eq!(messages[3].text(), Some("recent answer"));
+        assert_eq!(messages[1].text(), Some("recent question"));
+        assert_eq!(messages[2].text(), Some("recent answer"));
     }
 
     #[test]

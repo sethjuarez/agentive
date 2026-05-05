@@ -49,6 +49,10 @@ use crate::sanitize::sanitize_for_api;
 use crate::steering::Steering;
 use crate::types::*;
 
+const MAX_REQUEST_BUDGET_COMPACTION_ROUNDS: usize = 16;
+const REQUEST_BUDGET_TARGET_PERCENT: usize = 95;
+const SUMMARY_PREFIX: &str = "[Earlier conversation summary";
+
 /// A per-round tool filter function. Receives the current message history
 /// and returns the set of tools to offer the LLM for that round.
 pub type ToolFilter = Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>;
@@ -56,8 +60,9 @@ pub type ToolFilter = Arc<dyn Fn(&[ChatMessage]) -> Vec<Tool> + Send + Sync>;
 /// An async function that resolves `@reference` names to content.
 /// Receives the reference name (without the `@` prefix) and returns
 /// resolved content, or `None` if the reference is unknown.
-pub type ReferenceResolver =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<ResolvedReference>> + Send>> + Send + Sync>;
+pub type ReferenceResolver = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<ResolvedReference>> + Send>> + Send + Sync,
+>;
 
 /// A resolved `@reference` — content that gets injected into the conversation
 /// so the LLM can see the referenced material.
@@ -284,7 +289,10 @@ where
     Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
-    let run_id = config.run_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let run_id = config
+        .run_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let parent_run_id = config.parent_run_id.clone();
     let run_start = std::time::Instant::now();
 
@@ -339,8 +347,11 @@ where
                         message: "Generating AI summary of earlier conversation…".into(),
                     });
                     let llm_summary = crate::context::summarize_dropped_with_llm(
-                        &dropped, compaction_provider, &cancel,
-                    ).await;
+                        &dropped,
+                        compaction_provider,
+                        &cancel,
+                    )
+                    .await;
                     // Replace the string-based summary with the LLM one
                     // The summary is the first non-system user message
                     if !llm_summary.is_empty() {
@@ -350,7 +361,9 @@ where
                             .unwrap_or(0);
                         if system_end < full_messages.len()
                             && full_messages[system_end].role == "user"
-                            && full_messages[system_end].text().is_some_and(|t| t.starts_with("[Earlier conversation summary"))
+                            && full_messages[system_end]
+                                .text()
+                                .is_some_and(|t| t.starts_with("[Earlier conversation summary"))
                         {
                             full_messages[system_end] = ChatMessage::user(&llm_summary);
                         }
@@ -383,6 +396,10 @@ where
             .await?;
         }
 
+        if let GuardrailResult::Deny(reason) = guardrails.check_input(&full_messages) {
+            return Err(AgentError::Guardrailed(reason));
+        }
+
         let request = build_request(&full_messages, &round_tools, &config);
 
         // Spawn provider in a separate task for concurrent streaming
@@ -390,9 +407,8 @@ where
         let provider_clone = provider.clone();
         let cancel_clone = cancel.clone();
 
-        let provider_handle = tokio::spawn(async move {
-            provider_clone.chat(request, tx, &cancel_clone).await
-        });
+        let provider_handle =
+            tokio::spawn(async move { provider_clone.chat(request, tx, &cancel_clone).await });
 
         // Read events as they arrive
         let mut assistant_response: Option<ChatResponse> = None;
@@ -526,9 +542,25 @@ where
 
                 // Execute tool calls (parallel or sequential)
                 let tool_results = if config.parallel_tool_calls && tool_calls.len() > 1 {
-                    execute_tools_parallel(tool_calls, &tool_executor, &config, &guardrails, &on_event, iteration).await?
+                    execute_tools_parallel(
+                        tool_calls,
+                        &tool_executor,
+                        &config,
+                        &guardrails,
+                        &on_event,
+                        iteration,
+                    )
+                    .await?
                 } else {
-                    execute_tools_sequential(tool_calls, &tool_executor, &config, &guardrails, &on_event, iteration).await?
+                    execute_tools_sequential(
+                        tool_calls,
+                        &tool_executor,
+                        &config,
+                        &guardrails,
+                        &on_event,
+                        iteration,
+                    )
+                    .await?
                 };
 
                 for tool_msg in &tool_results {
@@ -549,11 +581,7 @@ where
         full_messages.push(response.message.clone());
         new_messages.push(response.message.clone());
 
-        let final_text = response
-            .message
-            .text()
-            .unwrap_or("")
-            .to_string();
+        let final_text = response.message.text().unwrap_or("").to_string();
 
         on_event(RunnerEvent::Done {
             response: final_text.clone(),
@@ -606,13 +634,29 @@ where
     let Some(budget) = provider.request_budget_bytes() else {
         return Ok(());
     };
+    let target_budget = budget * REQUEST_BUDGET_TARGET_PERCENT / 100;
+    let mut dropped_all = Vec::new();
 
-    for _ in 0..8 {
+    for _ in 0..MAX_REQUEST_BUDGET_COMPACTION_ROUNDS {
         let request = build_request(messages, round_tools, config);
         let Some(size) = provider.estimate_request_bytes(&request)? else {
             return Ok(());
         };
-        if size <= budget {
+        if size <= target_budget {
+            if !dropped_all.is_empty() {
+                insert_or_merge_summary(
+                    messages,
+                    build_compaction_summary(
+                        &dropped_all,
+                        &config.compaction_provider,
+                        cancel,
+                        on_event,
+                    )
+                    .await,
+                );
+                dropped_all.clear();
+                continue;
+            }
             return Ok(());
         }
 
@@ -623,24 +667,22 @@ where
                 provider.name()
             )));
         }
+        dropped_all.extend(dropped);
 
         on_event(RunnerEvent::Status {
             message: format!(
                 "Compacted request payload — summarized {} earlier message(s)",
-                dropped.len()
+                dropped_all.len()
             ),
         });
+    }
 
-        let summary = if let Some(compaction_provider) = &config.compaction_provider {
-            on_event(RunnerEvent::Status {
-                message: "Generating AI summary of earlier conversation…".into(),
-            });
-            crate::context::summarize_dropped_with_llm(&dropped, compaction_provider, cancel).await
-        } else {
-            crate::context::summarize_dropped(&dropped)
-        };
-
-        insert_or_merge_summary(messages, summary);
+    if !dropped_all.is_empty() {
+        insert_or_merge_summary(
+            messages,
+            build_compaction_summary(&dropped_all, &config.compaction_provider, cancel, on_event)
+                .await,
+        );
     }
 
     let request = build_request(messages, round_tools, config);
@@ -656,39 +698,92 @@ where
     Ok(())
 }
 
+async fn build_compaction_summary<E>(
+    dropped: &[ChatMessage],
+    compaction_provider: &Option<Arc<dyn Provider>>,
+    cancel: &CancellationToken,
+    on_event: &E,
+) -> String
+where
+    E: Fn(RunnerEvent) + Send + Sync,
+{
+    if let Some(compaction_provider) = compaction_provider {
+        on_event(RunnerEvent::Status {
+            message: "Generating AI summary of earlier conversation…".into(),
+        });
+        crate::context::summarize_dropped_with_llm(dropped, compaction_provider, cancel).await
+    } else {
+        crate::context::summarize_dropped(dropped)
+    }
+}
+
 fn drop_oldest_message_group(messages: &mut Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let prefix_end = messages
+    let mut idx = messages
         .iter()
         .position(|message| message.role != "system" && message.role != "developer")
         .unwrap_or(messages.len());
 
-    if messages.len() <= prefix_end + 2 {
+    while idx < messages.len()
+        && messages[idx].role == "user"
+        && messages[idx]
+            .text()
+            .is_some_and(|text| text.starts_with(SUMMARY_PREFIX))
+    {
+        idx += 1;
+    }
+
+    if messages.len() <= idx + 2 {
         return Vec::new();
     }
 
-    let removed = messages.remove(prefix_end);
-    let mut dropped = vec![removed.clone()];
-    if removed.role == "assistant" {
-        let call_ids = removed
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|call| call.id)
-            .collect::<std::collections::HashSet<_>>();
-
-        while !call_ids.is_empty()
-            && prefix_end < messages.len()
-            && messages[prefix_end].role == "tool"
-            && messages[prefix_end]
-                .tool_call_id
-                .as_ref()
-                .is_some_and(|id| call_ids.contains(id))
+    let mut dropped = vec![messages.remove(idx)];
+    if dropped[0].role == "user" {
+        while idx < messages.len()
+            && !matches!(messages[idx].role.as_str(), "user" | "system" | "developer")
         {
-            dropped.push(messages.remove(prefix_end));
+            dropped.push(messages.remove(idx));
         }
+    } else if dropped[0].role == "assistant" {
+        drop_matching_tool_results(messages, idx, &mut dropped);
+    }
+
+    while idx < messages.len()
+        && messages[idx].role == "user"
+        && messages[idx].text().is_some_and(is_tool_image_followup)
+    {
+        dropped.push(messages.remove(idx));
     }
 
     dropped
+}
+
+fn drop_matching_tool_results(
+    messages: &mut Vec<ChatMessage>,
+    idx: usize,
+    dropped: &mut Vec<ChatMessage>,
+) {
+    let call_ids = dropped
+        .last()
+        .and_then(|message| message.tool_calls.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|call| call.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    while !call_ids.is_empty()
+        && idx < messages.len()
+        && messages[idx].role == "tool"
+        && messages[idx]
+            .tool_call_id
+            .as_ref()
+            .is_some_and(|id| call_ids.contains(id))
+    {
+        dropped.push(messages.remove(idx));
+    }
+}
+
+fn is_tool_image_followup(text: &str) -> bool {
+    text.starts_with("[Images from the tool result above")
 }
 
 fn apply_tool_result_budget(text: &str, policy: &Option<ToolResultBudget>) -> String {
@@ -702,7 +797,9 @@ fn apply_tool_result_budget(text: &str, policy: &Option<ToolResultBudget>) -> St
     }
 
     let head_chars = policy.head_chars.min(policy.max_chars);
-    let tail_chars = policy.tail_chars.min(policy.max_chars.saturating_sub(head_chars));
+    let tail_chars = policy
+        .tail_chars
+        .min(policy.max_chars.saturating_sub(head_chars));
     let head = text.chars().take(head_chars).collect::<String>();
     let tail = text
         .chars()
@@ -719,6 +816,32 @@ fn apply_tool_result_budget(text: &str, policy: &Option<ToolResultBudget>) -> St
     )
 }
 
+fn apply_tool_image_budget(
+    images: &[ContentPart],
+    text_chars: usize,
+    policy: &Option<ToolResultBudget>,
+) -> Vec<ContentPart> {
+    let Some(policy) = policy else {
+        return images.to_vec();
+    };
+    let mut remaining = policy.max_chars.saturating_sub(text_chars);
+    let mut kept = Vec::new();
+
+    for image in images {
+        let approx_chars = match image {
+            ContentPart::Text { text } => text.chars().count(),
+            ContentPart::ImageUrl { image_url } => image_url.url.chars().count(),
+        };
+        if approx_chars > remaining {
+            break;
+        }
+        remaining -= approx_chars;
+        kept.push(image.clone());
+    }
+
+    kept
+}
+
 fn insert_or_merge_summary(messages: &mut Vec<ChatMessage>, summary: String) {
     if summary.trim().is_empty() {
         return;
@@ -733,9 +856,10 @@ fn insert_or_merge_summary(messages: &mut Vec<ChatMessage>, summary: String) {
         && messages[insert_at].role == "user"
         && messages[insert_at]
             .text()
-            .is_some_and(|text| text.starts_with("[Earlier conversation summary"))
+            .is_some_and(|text| text.starts_with(SUMMARY_PREFIX))
     {
-        messages[insert_at] = ChatMessage::user(&summary);
+        let existing = messages[insert_at].text().unwrap_or("");
+        messages[insert_at] = ChatMessage::user(&format!("{existing}\n\n{summary}"));
     } else {
         messages.insert(insert_at, ChatMessage::user(&summary));
     }
@@ -790,10 +914,15 @@ where
         results.push(ChatMessage::tool_result(&id, &clean_text));
         // Inject vision images as a follow-up user message
         if let Some(images) = output.images() {
+            let images = apply_tool_image_budget(
+                images,
+                clean_text.chars().count(),
+                &config.tool_result_budget,
+            );
             if !images.is_empty() {
                 results.push(ChatMessage::user_with_images(
                     "[Images from the tool result above — analyze these along with the text.]",
-                    images.to_vec(),
+                    images,
                 ));
             }
         }
@@ -815,24 +944,32 @@ where
     Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
-    let futures: Vec<_> = tool_calls.iter().map(|tc| {
-        let tc_clone = tc.clone();
-        let denied = match guardrails.check_tool(tc) {
-            GuardrailResult::Deny(reason) => Some(reason),
-            GuardrailResult::Allow => None,
-        };
-        async move {
-            let tool_start = std::time::Instant::now();
-            if let Some(reason) = denied {
-                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
-                Ok((tc_clone.id.clone(), tc_clone.function.name.clone(), ToolOutput::Text(format!("Tool denied by guardrail: {}", reason)), elapsed_ms))
-            } else {
-                let result = execute_tool_safe(tc_clone, tool_executor).await;
-                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
-                result.map(|(id, name, output)| (id, name, output, elapsed_ms))
+    let futures: Vec<_> = tool_calls
+        .iter()
+        .map(|tc| {
+            let tc_clone = tc.clone();
+            let denied = match guardrails.check_tool(tc) {
+                GuardrailResult::Deny(reason) => Some(reason),
+                GuardrailResult::Allow => None,
+            };
+            async move {
+                let tool_start = std::time::Instant::now();
+                if let Some(reason) = denied {
+                    let elapsed_ms = tool_start.elapsed().as_millis() as u64;
+                    Ok((
+                        tc_clone.id.clone(),
+                        tc_clone.function.name.clone(),
+                        ToolOutput::Text(format!("Tool denied by guardrail: {}", reason)),
+                        elapsed_ms,
+                    ))
+                } else {
+                    let result = execute_tool_safe(tc_clone, tool_executor).await;
+                    let elapsed_ms = tool_start.elapsed().as_millis() as u64;
+                    result.map(|(id, name, output)| (id, name, output, elapsed_ms))
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     let results = join_all(futures).await;
 
@@ -855,10 +992,15 @@ where
         messages.push(ChatMessage::tool_result(&id, &clean_text));
         // Inject vision images as a follow-up user message
         if let Some(images) = output.images() {
+            let images = apply_tool_image_budget(
+                images,
+                clean_text.chars().count(),
+                &config.tool_result_budget,
+            );
             if !images.is_empty() {
                 messages.push(ChatMessage::user_with_images(
                     "[Images from the tool result above — analyze these along with the text.]",
-                    images.to_vec(),
+                    images,
                 ));
             }
         }
@@ -867,7 +1009,10 @@ where
 }
 
 /// Execute a single tool call with panic safety via `catch_unwind` on the async future.
-async fn execute_tool_safe<F, Fut>(tc: ToolCall, tool_executor: &F) -> Result<(String, String, ToolOutput), AgentError>
+async fn execute_tool_safe<F, Fut>(
+    tc: ToolCall,
+    tool_executor: &F,
+) -> Result<(String, String, ToolOutput), AgentError>
 where
     F: Fn(ToolCall) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
@@ -1195,7 +1340,8 @@ mod tests {
             provider,
             vec![ChatMessage::user("Hi")],
             vec![],
-            |_| async { Ok(ToolOutput::from("unused")) },            RunnerConfig::default(),
+            |_| async { Ok(ToolOutput::from("unused")) },
+            RunnerConfig::default(),
             CancellationToken::new(),
             Steering::new(),
             Guardrails::default(),
@@ -1240,22 +1386,103 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            provider_for_assert
-                .request_sizes()
-                .into_iter()
-                .all(|size| size <= 900)
-        );
-        assert!(result
+        assert!(provider_for_assert
+            .request_sizes()
+            .into_iter()
+            .all(|size| size <= 900));
+        assert!(result.messages.iter().any(|message| message
+            .text()
+            .is_some_and(|text| text.starts_with("[Earlier conversation summary]"))));
+        assert!(!result.messages.iter().any(|message| message
+            .text()
+            .is_some_and(|text| text.contains(&"old context ".repeat(50)))));
+    }
+
+    #[tokio::test]
+    async fn test_request_byte_budget_appends_existing_summary() {
+        let provider = Arc::new(ByteBudgetMockProvider::new(
+            vec![ChatResponse {
+                message: ChatMessage::assistant("Done"),
+                usage: None,
+            }],
+            1_250,
+        ));
+
+        let result = run(
+            provider,
+            vec![
+                ChatMessage::system("You are helpful"),
+                ChatMessage::user("[Earlier conversation summary]\n• Prior summary survives"),
+                ChatMessage::user(&"old context ".repeat(200)),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("recent question"),
+            ],
+            vec![],
+            |_| async { Ok(ToolOutput::from("unused")) },
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let summary = result
             .messages
             .iter()
-            .any(|message| message.text().is_some_and(|text| text
-                .starts_with("[Earlier conversation summary]"))));
-        assert!(!result
-            .messages
-            .iter()
-            .any(|message| message.text().is_some_and(|text| text
-                .contains(&"old context ".repeat(50)))));
+            .find(|message| {
+                message
+                    .text()
+                    .is_some_and(|text| text.starts_with(SUMMARY_PREFIX))
+            })
+            .and_then(ChatMessage::text)
+            .unwrap();
+        assert!(summary.contains("Prior summary survives"));
+        assert!(summary.contains("old context"));
+    }
+
+    #[tokio::test]
+    async fn test_request_byte_budget_summary_is_guardrailed() {
+        let provider = Arc::new(ByteBudgetMockProvider::new(
+            vec![ChatResponse {
+                message: ChatMessage::assistant("unreachable"),
+                usage: None,
+            }],
+            900,
+        ));
+
+        let err = run(
+            provider,
+            vec![
+                ChatMessage::system("You are helpful"),
+                ChatMessage::user(&"old unsafe context ".repeat(200)),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("recent question"),
+            ],
+            vec![],
+            |_| async { Ok(ToolOutput::from("unused")) },
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::new().with_input_guardrail(|messages| {
+                let first_user_summary = messages
+                    .iter()
+                    .find(|message| message.role != "system" && message.role != "developer")
+                    .and_then(ChatMessage::text)
+                    .filter(|text| text.starts_with(SUMMARY_PREFIX));
+                if first_user_summary.is_some_and(|text| text.contains("unsafe")) {
+                    GuardrailResult::Deny("summary denied".into())
+                } else {
+                    GuardrailResult::Allow
+                }
+            }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("summary denied"));
     }
 
     #[tokio::test]
@@ -1377,7 +1604,13 @@ mod tests {
                 "Read a big thing",
                 serde_json::json!({"type":"object","properties":{}}),
             )],
-            |_| async { Ok(ToolOutput::from(format!("{}{}", "A".repeat(80), "Z".repeat(20)))) },
+            |_| async {
+                Ok(ToolOutput::from(format!(
+                    "{}{}",
+                    "A".repeat(80),
+                    "Z".repeat(20)
+                )))
+            },
             config,
             CancellationToken::new(),
             Steering::new(),
@@ -1396,6 +1629,67 @@ mod tests {
         assert!(tool_text.contains("Tool result truncated by Agentive"));
         assert!(tool_text.starts_with(&"A".repeat(20)));
         assert!(tool_text.ends_with(&"Z".repeat(10)));
+    }
+
+    #[tokio::test]
+    async fn test_tool_result_budget_drops_oversized_images() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "screenshot".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("Done"),
+                usage: None,
+            },
+        ]));
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("capture it")],
+            vec![Tool::function(
+                "screenshot",
+                "Capture a screenshot",
+                serde_json::json!({"type":"object","properties":{}}),
+            )],
+            |_| async {
+                Ok(ToolOutput::with_images(
+                    "small text",
+                    vec![ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: format!("data:image/png;base64,{}", "A".repeat(200)),
+                            detail: None,
+                        },
+                    }],
+                ))
+            },
+            RunnerConfig {
+                tool_result_budget: Some(ToolResultBudget {
+                    max_chars: 50,
+                    head_chars: 30,
+                    tail_chars: 10,
+                }),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(!result
+            .messages
+            .iter()
+            .any(|message| message.text().is_some_and(is_tool_image_followup)));
     }
 
     #[tokio::test]
@@ -1615,7 +1909,10 @@ mod tests {
                 let cc = count_clone.clone();
                 async move {
                     cc.fetch_add(1, Ordering::SeqCst);
-                    Ok(ToolOutput::from(format!("result from {}", tc.function.name)))
+                    Ok(ToolOutput::from(format!(
+                        "result from {}",
+                        tc.function.name
+                    )))
                 }
             },
             RunnerConfig {
@@ -1643,19 +1940,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_panic_safety() {
-        let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
-                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
-                    id: "c1".into(),
-                    call_type: "function".into(),
-                    function: FunctionCall {
-                        name: "panicking_tool".into(),
-                        arguments: "{}".into(),
-                    },
-                }]),
-                usage: None,
-            },
-        ]));
+        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+            message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "panicking_tool".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            usage: None,
+        }]));
 
         let result = run(
             provider,
@@ -1690,9 +1985,8 @@ mod tests {
             usage: None,
         }]));
 
-        let guardrails = Guardrails::new().with_input_guardrail(|_msgs| {
-            GuardrailResult::Deny("Blocked by policy".into())
-        });
+        let guardrails = Guardrails::new()
+            .with_input_guardrail(|_msgs| GuardrailResult::Deny("Blocked by policy".into()));
 
         let result = run(
             provider,
@@ -1775,7 +2069,11 @@ mod tests {
 
         assert_eq!(result.response, "Finished");
         // The dangerous tool should have a denial message, not a real result
-        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        let tool_msgs: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
         assert_eq!(tool_msgs.len(), 2);
         let denied = tool_msgs
             .iter()
@@ -2206,7 +2504,11 @@ mod tests {
         let result = run(
             provider,
             vec![ChatMessage::user("go")],
-            vec![Tool::function("failing_tool", "fails", serde_json::json!({}))],
+            vec![Tool::function(
+                "failing_tool",
+                "fails",
+                serde_json::json!({}),
+            )],
             |_| async { Err("Something went wrong".into()) },
             RunnerConfig::default(),
             CancellationToken::new(),
@@ -2218,7 +2520,11 @@ mod tests {
         .unwrap();
 
         // Tool error should be sent as a tool result containing the error
-        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        let tool_msgs: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
         assert_eq!(tool_msgs.len(), 1);
         assert!(tool_msgs[0].text().unwrap().contains("Tool error:"));
         assert_eq!(result.response, "Handled the error");
@@ -2290,7 +2596,11 @@ mod tests {
         .await
         .unwrap();
 
-        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        let tool_msgs: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
         assert_eq!(tool_msgs.len(), 3);
 
         // Exactly one should be denied
@@ -2299,34 +2609,35 @@ mod tests {
             .filter(|m| m.text().unwrap_or("").contains("denied by guardrail"))
             .collect();
         assert_eq!(denied.len(), 1);
-        assert!(denied[0].text().unwrap().contains("Not allowed in parallel"));
+        assert!(denied[0]
+            .text()
+            .unwrap()
+            .contains("Not allowed in parallel"));
     }
 
     #[tokio::test]
     async fn test_parallel_tool_panic_one_of_many() {
-        let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
-                message: ChatMessage::assistant_with_tool_calls(vec![
-                    ToolCall {
-                        id: "c1".into(),
-                        call_type: "function".into(),
-                        function: FunctionCall {
-                            name: "good_tool".into(),
-                            arguments: "{}".into(),
-                        },
+        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+            message: ChatMessage::assistant_with_tool_calls(vec![
+                ToolCall {
+                    id: "c1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "good_tool".into(),
+                        arguments: "{}".into(),
                     },
-                    ToolCall {
-                        id: "c2".into(),
-                        call_type: "function".into(),
-                        function: FunctionCall {
-                            name: "bad_tool".into(),
-                            arguments: "{}".into(),
-                        },
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "bad_tool".into(),
+                        arguments: "{}".into(),
                     },
-                ]),
-                usage: None,
-            },
-        ]));
+                },
+            ]),
+            usage: None,
+        }]));
 
         let result = run(
             provider,
@@ -2554,7 +2865,10 @@ mod tests {
                     // Small delay to make ordering visible
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     oc.lock().unwrap().push(tc.function.name.clone());
-                    Ok(ToolOutput::from(format!("result from {}", tc.function.name)))
+                    Ok(ToolOutput::from(format!(
+                        "result from {}",
+                        tc.function.name
+                    )))
                 }
             },
             RunnerConfig {
@@ -2601,22 +2915,33 @@ mod tests {
                 Ok(())
             }
 
-            fn name(&self) -> &str { "compaction_mock" }
+            fn name(&self) -> &str {
+                "compaction_mock"
+            }
         }
 
         // Create a main provider with a small context budget to trigger compaction
-        let main_provider = Arc::new(SmallBudgetMockProvider::new(vec![
-            ChatResponse {
+        let main_provider = Arc::new(SmallBudgetMockProvider::new(
+            vec![ChatResponse {
                 message: ChatMessage::assistant("Continuing from where we left off"),
                 usage: None,
-            },
-        ], 10_000));
+            }],
+            10_000,
+        ));
 
         // Build a large message history that will trigger compaction
         let mut messages = vec![ChatMessage::system("You are helpful")];
         for i in 0..100 {
-            messages.push(ChatMessage::user(&format!("Long question {}: {}", i, "x".repeat(500))));
-            messages.push(ChatMessage::assistant(&format!("Long answer {}: {}", i, "y".repeat(500))));
+            messages.push(ChatMessage::user(&format!(
+                "Long question {}: {}",
+                i,
+                "x".repeat(500)
+            )));
+            messages.push(ChatMessage::assistant(&format!(
+                "Long answer {}: {}",
+                i,
+                "y".repeat(500)
+            )));
         }
         messages.push(ChatMessage::user("Final question"));
 
@@ -2663,14 +2988,25 @@ mod tests {
         // Verify the LLM summary was inserted into the message history
         let summary_msg = result.messages.iter().find(|m| {
             m.role == "user"
-                && m.text().is_some_and(|t| t.contains("ownership and borrowing"))
+                && m.text()
+                    .is_some_and(|t| t.contains("ownership and borrowing"))
         });
         assert!(
             summary_msg.is_some(),
             "LLM summary should be in the conversation history. Messages: {:?}",
-            result.messages.iter().map(|m| format!("{}: {}", m.role, m.text().unwrap_or("(none)")
-                .chars().take(80).collect::<String>()
-            )).collect::<Vec<_>>()
+            result
+                .messages
+                .iter()
+                .map(|m| format!(
+                    "{}: {}",
+                    m.role,
+                    m.text()
+                        .unwrap_or("(none)")
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                ))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2688,27 +3024,43 @@ mod tests {
                 tx: mpsc::Sender<ChatEvent>,
                 _cancel: &CancellationToken,
             ) -> Result<(), AgentError> {
-                let _ = tx.send(ChatEvent::Error {
-                    message: "API rate limit exceeded".into(),
-                }).await;
-                Err(AgentError::Api { status: 429, message: "Rate limited".into() })
+                let _ = tx
+                    .send(ChatEvent::Error {
+                        message: "API rate limit exceeded".into(),
+                    })
+                    .await;
+                Err(AgentError::Api {
+                    status: 429,
+                    message: "Rate limited".into(),
+                })
             }
 
-            fn name(&self) -> &str { "failing_compaction" }
+            fn name(&self) -> &str {
+                "failing_compaction"
+            }
         }
 
-        let main_provider = Arc::new(SmallBudgetMockProvider::new(vec![
-            ChatResponse {
+        let main_provider = Arc::new(SmallBudgetMockProvider::new(
+            vec![ChatResponse {
                 message: ChatMessage::assistant("Handled it"),
                 usage: None,
-            },
-        ], 10_000));
+            }],
+            10_000,
+        ));
 
         // Large history to trigger compaction
         let mut messages = vec![ChatMessage::system("System prompt")];
         for i in 0..100 {
-            messages.push(ChatMessage::user(&format!("Question {}: {}", i, "x".repeat(500))));
-            messages.push(ChatMessage::assistant(&format!("Answer {}: {}", i, "y".repeat(500))));
+            messages.push(ChatMessage::user(&format!(
+                "Question {}: {}",
+                i,
+                "x".repeat(500)
+            )));
+            messages.push(ChatMessage::assistant(&format!(
+                "Answer {}: {}",
+                i,
+                "y".repeat(500)
+            )));
         }
         messages.push(ChatMessage::user("Latest question"));
 
@@ -2735,7 +3087,8 @@ mod tests {
         // The string-based summary should still be present (fallback)
         let has_summary = result.messages.iter().any(|m| {
             m.role == "user"
-                && m.text().is_some_and(|t| t.starts_with("[Earlier conversation summary]"))
+                && m.text()
+                    .is_some_and(|t| t.starts_with("[Earlier conversation summary]"))
         });
         assert!(
             has_summary,
@@ -2747,18 +3100,23 @@ mod tests {
     async fn test_compaction_preserves_system_messages() {
         // Verify that context compaction never drops system messages
 
-        let main_provider = Arc::new(SmallBudgetMockProvider::new(vec![
-            ChatResponse {
+        let main_provider = Arc::new(SmallBudgetMockProvider::new(
+            vec![ChatResponse {
                 message: ChatMessage::assistant("Responded after compaction"),
                 usage: None,
-            },
-        ], 10_000));
+            }],
+            10_000,
+        ));
 
         let system_prompt = "You are a specialized Rust tutor.";
         let mut messages = vec![ChatMessage::system(system_prompt)];
         for i in 0..100 {
             messages.push(ChatMessage::user(&format!("Q{}: {}", i, "x".repeat(500))));
-            messages.push(ChatMessage::assistant(&format!("A{}: {}", i, "y".repeat(500))));
+            messages.push(ChatMessage::assistant(&format!(
+                "A{}: {}",
+                i,
+                "y".repeat(500)
+            )));
         }
         messages.push(ChatMessage::user("Final"));
 
@@ -2837,18 +3195,28 @@ mod tests {
                 let cc2 = cc.clone();
                 async move {
                     cc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(ToolOutput::from(format!("result from {}", tc.function.name)))
+                    Ok(ToolOutput::from(format!(
+                        "result from {}",
+                        tc.function.name
+                    )))
                 }
             },
             RunnerConfig {
                 tool_filter: Some(Arc::new(move |msgs| {
                     fcc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let has_read_result = msgs.iter().any(|m| {
-                        m.role == "tool" && m.text().is_some_and(|t| t.contains("result from read_file"))
+                        m.role == "tool"
+                            && m.text()
+                                .is_some_and(|t| t.contains("result from read_file"))
                     });
-                    let mut tools = vec![Tool::function("read_file", "reads", serde_json::json!({}))];
+                    let mut tools =
+                        vec![Tool::function("read_file", "reads", serde_json::json!({}))];
                     if has_read_result {
-                        tools.push(Tool::function("write_file", "writes", serde_json::json!({})));
+                        tools.push(Tool::function(
+                            "write_file",
+                            "writes",
+                            serde_json::json!({}),
+                        ));
                     }
                     tools
                 })),
@@ -2865,7 +3233,10 @@ mod tests {
         assert_eq!(result.response, "Read and wrote successfully");
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
         // Filter should have been called 3 times (once per round)
-        assert_eq!(filter_call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            filter_call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
     }
 
     #[tokio::test]
@@ -2919,18 +3290,35 @@ mod tests {
 
         // Check ToolCallStart has tool_call_id and iteration
         let events = events.lock().unwrap();
-        let tool_start = events.iter().find(|e| matches!(e, RunnerEvent::ToolCallStart { .. }));
+        let tool_start = events
+            .iter()
+            .find(|e| matches!(e, RunnerEvent::ToolCallStart { .. }));
         assert!(tool_start.is_some(), "Should have a ToolCallStart event");
-        if let RunnerEvent::ToolCallStart { name, tool_call_id, iteration, .. } = tool_start.unwrap() {
+        if let RunnerEvent::ToolCallStart {
+            name,
+            tool_call_id,
+            iteration,
+            ..
+        } = tool_start.unwrap()
+        {
             assert_eq!(name, "my_tool");
             assert_eq!(tool_call_id, "call_abc123");
             assert_eq!(*iteration, 0); // First round
         }
 
         // Check ToolResult has tool_call_id, elapsed_ms, and iteration
-        let tool_result = events.iter().find(|e| matches!(e, RunnerEvent::ToolResult { .. }));
+        let tool_result = events
+            .iter()
+            .find(|e| matches!(e, RunnerEvent::ToolResult { .. }));
         assert!(tool_result.is_some(), "Should have a ToolResult event");
-        if let RunnerEvent::ToolResult { name, tool_call_id, elapsed_ms, iteration, .. } = tool_result.unwrap() {
+        if let RunnerEvent::ToolResult {
+            name,
+            tool_call_id,
+            elapsed_ms,
+            iteration,
+            ..
+        } = tool_result.unwrap()
+        {
             assert_eq!(name, "my_tool");
             assert_eq!(tool_call_id, "call_abc123");
             assert!(*elapsed_ms < 1000, "Tool should complete quickly in test");
@@ -2938,7 +3326,9 @@ mod tests {
         }
 
         // Check Done has elapsed_ms
-        let done = events.iter().find(|e| matches!(e, RunnerEvent::Done { .. }));
+        let done = events
+            .iter()
+            .find(|e| matches!(e, RunnerEvent::Done { .. }));
         assert!(done.is_some(), "Should have a Done event");
         if let RunnerEvent::Done { elapsed_ms, .. } = done.unwrap() {
             assert!(*elapsed_ms < 5000, "Run should complete quickly in test");
@@ -2947,12 +3337,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_id_auto_generated() {
-        let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
-                message: ChatMessage::assistant("hello"),
-                usage: None,
-            },
-        ]));
+        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+            message: ChatMessage::assistant("hello"),
+            usage: None,
+        }]));
 
         let result = run(
             provider,
@@ -2969,9 +3357,16 @@ mod tests {
         .unwrap();
 
         // run_id should be a valid UUID v4 (36 chars with hyphens)
-        assert_eq!(result.run_id.len(), 36, "Auto-generated run_id should be a UUID");
+        assert_eq!(
+            result.run_id.len(),
+            36,
+            "Auto-generated run_id should be a UUID"
+        );
         assert!(result.run_id.contains('-'), "UUID should contain hyphens");
-        assert!(result.parent_run_id.is_none(), "No parent_run_id by default");
+        assert!(
+            result.parent_run_id.is_none(),
+            "No parent_run_id by default"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3023,8 +3418,7 @@ mod tests {
 
     #[test]
     fn test_extract_references_url_with_query() {
-        let refs =
-            extract_references("See @https://docs.rs/agentive/latest?q=web and @blog/intro");
+        let refs = extract_references("See @https://docs.rs/agentive/latest?q=web and @blog/intro");
         assert_eq!(
             refs,
             vec!["https://docs.rs/agentive/latest?q=web", "blog/intro"]
@@ -3069,13 +3463,31 @@ mod tests {
 
         // User message has resolved content appended
         let user_text = messages[1].text().unwrap().to_string();
-        assert!(user_text.contains("Please review @intro.sk"), "original text preserved");
-        assert!(user_text.contains("<referenced_document name=\"intro.sk\""), "intro resolved");
-        assert!(user_text.contains("Welcome to the demo."), "intro content injected");
-        assert!(user_text.contains("<referenced_document name=\"notes.md\""), "notes resolved");
-        assert!(user_text.contains("Some planning notes."), "notes content injected");
+        assert!(
+            user_text.contains("Please review @intro.sk"),
+            "original text preserved"
+        );
+        assert!(
+            user_text.contains("<referenced_document name=\"intro.sk\""),
+            "intro resolved"
+        );
+        assert!(
+            user_text.contains("Welcome to the demo."),
+            "intro content injected"
+        );
+        assert!(
+            user_text.contains("<referenced_document name=\"notes.md\""),
+            "notes resolved"
+        );
+        assert!(
+            user_text.contains("Some planning notes."),
+            "notes content injected"
+        );
         // @unknown should NOT have a referenced_document block
-        assert!(!user_text.contains("name=\"unknown\""), "unknown ref not injected");
+        assert!(
+            !user_text.contains("name=\"unknown\""),
+            "unknown ref not injected"
+        );
     }
 
     #[tokio::test]
@@ -3093,9 +3505,7 @@ mod tests {
             })
         });
 
-        let mut messages = vec![
-            ChatMessage::user("Check @test please"),
-        ];
+        let mut messages = vec![ChatMessage::user("Check @test please")];
 
         // First resolution
         resolve_references_in_messages(&mut messages, &resolver).await;
@@ -3103,7 +3513,11 @@ mod tests {
 
         // Second resolution — should skip (already has <referenced_document)
         resolve_references_in_messages(&mut messages, &resolver).await;
-        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1, "should not re-resolve");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "should not re-resolve"
+        );
     }
 
     #[tokio::test]
@@ -3123,12 +3537,10 @@ mod tests {
             })
         });
 
-        let provider = Arc::new(MockProvider::new(vec![
-            ChatResponse {
-                message: ChatMessage::assistant("I see the context document."),
-                usage: None,
-            },
-        ]));
+        let provider = Arc::new(MockProvider::new(vec![ChatResponse {
+            message: ChatMessage::assistant("I see the context document."),
+            usage: None,
+        }]));
 
         let result = run(
             provider,
@@ -3155,8 +3567,14 @@ mod tests {
         // The messages sent to the LLM should contain the resolved reference
         let user_msg = result.messages.iter().find(|m| m.role == "user").unwrap();
         let text = user_msg.text().unwrap();
-        assert!(text.contains("Important context document."), "resolved content should be in messages");
-        assert!(text.contains("<referenced_document"), "should have XML wrapper");
+        assert!(
+            text.contains("Important context document."),
+            "resolved content should be in messages"
+        );
+        assert!(
+            text.contains("<referenced_document"),
+            "should have XML wrapper"
+        );
     }
 
     #[tokio::test]
@@ -3183,7 +3601,11 @@ mod tests {
         let result = run(
             provider,
             vec![ChatMessage::user("describe the sketch")],
-            vec![Tool::function("read_sketch", "Read a sketch", serde_json::json!({}))],
+            vec![Tool::function(
+                "read_sketch",
+                "Read a sketch",
+                serde_json::json!({}),
+            )],
             |_tc| async {
                 Ok(ToolOutput::with_images(
                     "Sketch title: Login Page",
@@ -3204,21 +3626,36 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.response, "I can see the screenshot shows a login form.");
+        assert_eq!(
+            result.response,
+            "I can see the screenshot shows a login form."
+        );
 
         // Should have: user, assistant(tool_call), tool_result, user(images), assistant(final)
-        let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+        let tool_msgs: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
         assert_eq!(tool_msgs.len(), 1);
         assert_eq!(tool_msgs[0].text().unwrap(), "Sketch title: Login Page");
 
         // The injected user message with images should follow the tool result
-        let image_msgs: Vec<_> = result.messages.iter().filter(|m| {
-            m.role == "user" && matches!(&m.content, Some(MessageContent::Parts(_)))
-        }).collect();
-        assert_eq!(image_msgs.len(), 1, "should inject one user message with images");
+        let image_msgs: Vec<_> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" && matches!(&m.content, Some(MessageContent::Parts(_))))
+            .collect();
+        assert_eq!(
+            image_msgs.len(),
+            1,
+            "should inject one user message with images"
+        );
 
         if let Some(MessageContent::Parts(parts)) = &image_msgs[0].content {
-            assert!(parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. })));
+            assert!(parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })));
             assert!(parts.iter().any(|p| matches!(p, ContentPart::Text { .. })));
         } else {
             panic!("expected Parts content");
