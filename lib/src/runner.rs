@@ -72,6 +72,27 @@ pub struct ResolvedReference {
     pub content_type: String,
 }
 
+/// Policy for bounding tool result text before it is appended to history.
+#[derive(Debug, Clone)]
+pub struct ToolResultBudget {
+    /// Maximum characters to keep for one tool result.
+    pub max_chars: usize,
+    /// Characters to preserve from the beginning of an oversized result.
+    pub head_chars: usize,
+    /// Characters to preserve from the end of an oversized result.
+    pub tail_chars: usize,
+}
+
+impl Default for ToolResultBudget {
+    fn default() -> Self {
+        Self {
+            max_chars: 24_000,
+            head_chars: 16_000,
+            tail_chars: 4_000,
+        }
+    }
+}
+
 /// Configuration for the runner.
 pub struct RunnerConfig {
     /// Maximum number of tool-call rounds before giving up.
@@ -82,6 +103,9 @@ pub struct RunnerConfig {
     pub auto_trim_context: bool,
     /// Whether to sanitize tool results (strip control chars, base64).
     pub sanitize_tool_results: bool,
+    /// Optional policy for truncating very large tool results before they enter
+    /// the conversation history.
+    pub tool_result_budget: Option<ToolResultBudget>,
     /// Whether to execute multiple tool calls concurrently (default: true).
     pub parallel_tool_calls: bool,
     /// Optional structured output format (JSON mode or JSON schema).
@@ -118,6 +142,7 @@ impl Clone for RunnerConfig {
             retry_on_400: self.retry_on_400,
             auto_trim_context: self.auto_trim_context,
             sanitize_tool_results: self.sanitize_tool_results,
+            tool_result_budget: self.tool_result_budget.clone(),
             parallel_tool_calls: self.parallel_tool_calls,
             response_format: self.response_format.clone(),
             compaction_provider: self.compaction_provider.clone(),
@@ -136,6 +161,7 @@ impl std::fmt::Debug for RunnerConfig {
             .field("retry_on_400", &self.retry_on_400)
             .field("auto_trim_context", &self.auto_trim_context)
             .field("sanitize_tool_results", &self.sanitize_tool_results)
+            .field("tool_result_budget", &self.tool_result_budget)
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("response_format", &self.response_format)
             .field("compaction_provider", &self.compaction_provider.is_some())
@@ -154,6 +180,7 @@ impl Default for RunnerConfig {
             retry_on_400: true,
             auto_trim_context: true,
             sanitize_tool_results: true,
+            tool_result_budget: Some(ToolResultBudget::default()),
             parallel_tool_calls: true,
             response_format: None,
             compaction_provider: None,
@@ -344,18 +371,19 @@ where
             tools.clone()
         };
 
-        // Build request
-        let request = ChatRequest {
-            messages: full_messages.clone(),
-            model: String::new(), // Provider uses its own model
-            tools: if round_tools.is_empty() {
-                None
-            } else {
-                Some(round_tools.clone())
-            },
-            stream: true,
-            response_format: config.response_format.clone(),
-        };
+        if config.auto_trim_context {
+            compact_to_request_budget(
+                full_messages.as_mut(),
+                provider.as_ref(),
+                &round_tools,
+                &config,
+                &cancel,
+                &on_event,
+            )
+            .await?;
+        }
+
+        let request = build_request(&full_messages, &round_tools, &config);
 
         // Spawn provider in a separate task for concurrent streaming
         let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
@@ -412,17 +440,7 @@ where
                     });
 
                     // Retry once
-                    let request2 = ChatRequest {
-                        messages: full_messages.clone(),
-                        model: String::new(),
-                        tools: if round_tools.is_empty() {
-                            None
-                        } else {
-                            Some(round_tools.clone())
-                        },
-                        stream: true,
-                        response_format: config.response_format.clone(),
-                    };
+                    let request2 = build_request(&full_messages, &round_tools, &config);
 
                     let (tx2, mut rx2) = mpsc::channel::<ChatEvent>(64);
                     let provider_clone2 = provider.clone();
@@ -556,6 +574,173 @@ where
     Err(AgentError::MaxIterations(config.max_iterations))
 }
 
+fn build_request(
+    messages: &[ChatMessage],
+    round_tools: &[Tool],
+    config: &RunnerConfig,
+) -> ChatRequest {
+    ChatRequest {
+        messages: messages.to_vec(),
+        model: String::new(),
+        tools: if round_tools.is_empty() {
+            None
+        } else {
+            Some(round_tools.to_vec())
+        },
+        stream: true,
+        response_format: config.response_format.clone(),
+    }
+}
+
+async fn compact_to_request_budget<E>(
+    messages: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    round_tools: &[Tool],
+    config: &RunnerConfig,
+    cancel: &CancellationToken,
+    on_event: &E,
+) -> Result<(), AgentError>
+where
+    E: Fn(RunnerEvent) + Send + Sync,
+{
+    let Some(budget) = provider.request_budget_bytes() else {
+        return Ok(());
+    };
+
+    for _ in 0..8 {
+        let request = build_request(messages, round_tools, config);
+        let Some(size) = provider.estimate_request_bytes(&request)? else {
+            return Ok(());
+        };
+        if size <= budget {
+            return Ok(());
+        }
+
+        let dropped = drop_oldest_message_group(messages);
+        if dropped.is_empty() {
+            return Err(AgentError::Stream(format!(
+                "Request body is too large for provider '{}' after compaction: {size} bytes exceeds {budget} bytes",
+                provider.name()
+            )));
+        }
+
+        on_event(RunnerEvent::Status {
+            message: format!(
+                "Compacted request payload — summarized {} earlier message(s)",
+                dropped.len()
+            ),
+        });
+
+        let summary = if let Some(compaction_provider) = &config.compaction_provider {
+            on_event(RunnerEvent::Status {
+                message: "Generating AI summary of earlier conversation…".into(),
+            });
+            crate::context::summarize_dropped_with_llm(&dropped, compaction_provider, cancel).await
+        } else {
+            crate::context::summarize_dropped(&dropped)
+        };
+
+        insert_or_merge_summary(messages, summary);
+    }
+
+    let request = build_request(messages, round_tools, config);
+    if let Some(size) = provider.estimate_request_bytes(&request)? {
+        if size > budget {
+            return Err(AgentError::Stream(format!(
+                "Request body is too large for provider '{}' after repeated compaction: {size} bytes exceeds {budget} bytes",
+                provider.name()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn drop_oldest_message_group(messages: &mut Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let prefix_end = messages
+        .iter()
+        .position(|message| message.role != "system" && message.role != "developer")
+        .unwrap_or(messages.len());
+
+    if messages.len() <= prefix_end + 2 {
+        return Vec::new();
+    }
+
+    let removed = messages.remove(prefix_end);
+    let mut dropped = vec![removed.clone()];
+    if removed.role == "assistant" {
+        let call_ids = removed
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|call| call.id)
+            .collect::<std::collections::HashSet<_>>();
+
+        while !call_ids.is_empty()
+            && prefix_end < messages.len()
+            && messages[prefix_end].role == "tool"
+            && messages[prefix_end]
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| call_ids.contains(id))
+        {
+            dropped.push(messages.remove(prefix_end));
+        }
+    }
+
+    dropped
+}
+
+fn apply_tool_result_budget(text: &str, policy: &Option<ToolResultBudget>) -> String {
+    let Some(policy) = policy else {
+        return text.to_string();
+    };
+
+    let total = text.chars().count();
+    if total <= policy.max_chars {
+        return text.to_string();
+    }
+
+    let head_chars = policy.head_chars.min(policy.max_chars);
+    let tail_chars = policy.tail_chars.min(policy.max_chars.saturating_sub(head_chars));
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    let omitted = total.saturating_sub(head_chars + tail_chars);
+
+    format!(
+        "{head}\n\n[Tool result truncated by Agentive: omitted {omitted} character(s) from the middle. Ask the tool for a narrower range if you need more detail.]\n\n{tail}"
+    )
+}
+
+fn insert_or_merge_summary(messages: &mut Vec<ChatMessage>, summary: String) {
+    if summary.trim().is_empty() {
+        return;
+    }
+
+    let insert_at = messages
+        .iter()
+        .position(|message| message.role != "system" && message.role != "developer")
+        .unwrap_or(messages.len());
+
+    if insert_at < messages.len()
+        && messages[insert_at].role == "user"
+        && messages[insert_at]
+            .text()
+            .is_some_and(|text| text.starts_with("[Earlier conversation summary"))
+    {
+        messages[insert_at] = ChatMessage::user(&summary);
+    } else {
+        messages.insert(insert_at, ChatMessage::user(&summary));
+    }
+}
+
 /// Execute tool calls sequentially with panic safety and guardrails.
 async fn execute_tools_sequential<F, Fut, E>(
     tool_calls: &[ToolCall],
@@ -589,11 +774,12 @@ where
         let tool_start = std::time::Instant::now();
         let (id, name, output) = execute_tool_safe(tc.clone(), tool_executor).await?;
         let elapsed_ms = tool_start.elapsed().as_millis() as u64;
-        let clean_text = if config.sanitize_tool_results {
+        let sanitized_text = if config.sanitize_tool_results {
             sanitize_for_api(output.text())
         } else {
             output.text().to_string()
         };
+        let clean_text = apply_tool_result_budget(&sanitized_text, &config.tool_result_budget);
         on_event(RunnerEvent::ToolResult {
             name,
             result: clean_text.clone(),
@@ -653,11 +839,12 @@ where
     let mut messages = Vec::with_capacity(tool_calls.len());
     for res in results {
         let (id, name, output, elapsed_ms) = res?;
-        let clean_text = if config.sanitize_tool_results {
+        let sanitized_text = if config.sanitize_tool_results {
             sanitize_for_api(output.text())
         } else {
             output.text().to_string()
         };
+        let clean_text = apply_tool_result_budget(&sanitized_text, &config.tool_result_budget);
         on_event(RunnerEvent::ToolResult {
             name,
             result: clean_text.clone(),
@@ -939,6 +1126,61 @@ mod tests {
         }
     }
 
+    struct ByteBudgetMockProvider {
+        inner: MockProvider,
+        budget: usize,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl ByteBudgetMockProvider {
+        fn new(responses: Vec<ChatResponse>, budget: usize) -> Self {
+            Self {
+                inner: MockProvider::new(responses),
+                budget,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn request_sizes(&self) -> Vec<usize> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| serde_json::to_string(request).unwrap().len())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for ByteBudgetMockProvider {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.inner.chat(request, tx, cancel).await
+        }
+
+        fn name(&self) -> &str {
+            "byte_budget_mock"
+        }
+
+        fn request_budget_bytes(&self) -> Option<usize> {
+            Some(self.budget)
+        }
+
+        fn estimate_request_bytes(
+            &self,
+            request: &ChatRequest,
+        ) -> Result<Option<usize>, AgentError> {
+            serde_json::to_string(request)
+                .map(|body| Some(body.len()))
+                .map_err(AgentError::from)
+        }
+    }
+
     #[tokio::test]
     async fn test_simple_conversation() {
         let provider = Arc::new(MockProvider::new(vec![ChatResponse {
@@ -966,6 +1208,85 @@ mod tests {
 
         assert_eq!(result.response, "Hello! How can I help?");
         assert!(result.messages.len() >= 2); // user + assistant
+    }
+
+    #[tokio::test]
+    async fn test_request_byte_budget_triggers_summary_compaction() {
+        let provider = Arc::new(ByteBudgetMockProvider::new(
+            vec![ChatResponse {
+                message: ChatMessage::assistant("Done"),
+                usage: None,
+            }],
+            900,
+        ));
+        let provider_for_assert = provider.clone();
+
+        let result = run(
+            provider,
+            vec![
+                ChatMessage::system("You are helpful"),
+                ChatMessage::user(&"old context ".repeat(200)),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("recent question"),
+            ],
+            vec![],
+            |_| async { Ok(ToolOutput::from("unused")) },
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            provider_for_assert
+                .request_sizes()
+                .into_iter()
+                .all(|size| size <= 900)
+        );
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| message.text().is_some_and(|text| text
+                .starts_with("[Earlier conversation summary]"))));
+        assert!(!result
+            .messages
+            .iter()
+            .any(|message| message.text().is_some_and(|text| text
+                .contains(&"old context ".repeat(50)))));
+    }
+
+    #[tokio::test]
+    async fn test_request_byte_budget_errors_when_irreducible() {
+        let provider = Arc::new(ByteBudgetMockProvider::new(
+            vec![ChatResponse {
+                message: ChatMessage::assistant("unreachable"),
+                usage: None,
+            }],
+            100,
+        ));
+
+        let err = run(
+            provider,
+            vec![
+                ChatMessage::system(&"large system ".repeat(100)),
+                ChatMessage::user("recent question"),
+                ChatMessage::assistant("recent answer"),
+            ],
+            vec![],
+            |_| async { Ok(ToolOutput::from("unused")) },
+            RunnerConfig::default(),
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("too large"));
     }
 
     #[tokio::test]
@@ -1017,6 +1338,64 @@ mod tests {
         assert_eq!(result.response, "The file contains: hello world");
         // Should have: system, user, assistant(tool_call), tool_result, assistant(final)
         assert_eq!(result.messages.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_tool_result_budget_truncates_large_outputs() {
+        let provider = Arc::new(MockProvider::new(vec![
+            ChatResponse {
+                message: ChatMessage::assistant_with_tool_calls(vec![ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_big".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                usage: None,
+            },
+            ChatResponse {
+                message: ChatMessage::assistant("Done"),
+                usage: None,
+            },
+        ]));
+
+        let config = RunnerConfig {
+            tool_result_budget: Some(ToolResultBudget {
+                max_chars: 50,
+                head_chars: 20,
+                tail_chars: 10,
+            }),
+            ..Default::default()
+        };
+
+        let result = run(
+            provider,
+            vec![ChatMessage::user("read it")],
+            vec![Tool::function(
+                "read_big",
+                "Read a big thing",
+                serde_json::json!({"type":"object","properties":{}}),
+            )],
+            |_| async { Ok(ToolOutput::from(format!("{}{}", "A".repeat(80), "Z".repeat(20)))) },
+            config,
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let tool_text = result
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(ChatMessage::text)
+            .unwrap();
+        assert!(tool_text.contains("Tool result truncated by Agentive"));
+        assert!(tool_text.starts_with(&"A".repeat(20)));
+        assert!(tool_text.ends_with(&"Z".repeat(10)));
     }
 
     #[tokio::test]

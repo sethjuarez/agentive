@@ -175,23 +175,8 @@ impl AnthropicProvider {
         system_prompt: &Option<String>,
         tools: &Option<Vec<serde_json::Value>>,
     ) -> Result<serde_json::Value, AgentError> {
-        let make_body = |messages: &[serde_json::Value]| -> Result<serde_json::Value, AgentError> {
-            let mut body = serde_json::json!({
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": 4096,
-                "stream": true,
-            });
-
-            if let Some(sys) = system_prompt {
-                body["system"] = serde_json::json!(sys);
-            }
-            if let Some(t) = tools {
-                body["tools"] = serde_json::json!(t);
-            }
-
-            Ok(body)
-        };
+        let make_body =
+            |messages: &[serde_json::Value]| Ok(self.request_body(messages, system_prompt, tools));
 
         compact_items_to_request_limit(
             messages,
@@ -452,9 +437,49 @@ impl Provider for AnthropicProvider {
     fn context_budget_chars(&self) -> usize {
         self.context_budget
     }
+
+    fn request_budget_bytes(&self) -> Option<usize> {
+        (self.max_request_bytes != usize::MAX).then_some(self.max_request_bytes)
+    }
+
+    fn estimate_request_bytes(&self, request: &ChatRequest) -> Result<Option<usize>, AgentError> {
+        if self.request_budget_bytes().is_none() {
+            return Ok(None);
+        }
+
+        let (system_prompt, messages, tools) = self.prepare_request(request);
+        serde_json::to_string(&self.request_body(&messages, &system_prompt, &tools))
+            .map(|body| Some(body.len()))
+            .map_err(AgentError::from)
+    }
 }
 
 // -- Helpers -----------------------------------------------------------------
+
+impl AnthropicProvider {
+    fn request_body(
+        &self,
+        messages: &[serde_json::Value],
+        system_prompt: &Option<String>,
+        tools: &Option<Vec<serde_json::Value>>,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 4096,
+            "stream": true,
+        });
+
+        if let Some(sys) = system_prompt {
+            body["system"] = serde_json::json!(sys);
+        }
+        if let Some(t) = tools {
+            body["tools"] = serde_json::json!(t);
+        }
+
+        body
+    }
+}
 
 struct PendingToolUse {
     id: String,

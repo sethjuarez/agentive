@@ -219,23 +219,30 @@ impl ResponsesProvider {
     /// Build the JSON request body, compacting input items if the serialized
     /// size exceeds `max_request_bytes`. Drops oldest non-system items first,
     /// keeping tool_call/function_call_output pairs together.
+    fn request_body(
+        &self,
+        input: &[serde_json::Value],
+        tools_json: &Option<serde_json::Value>,
+        stream: bool,
+    ) -> serde_json::Value {
+        let mut b = serde_json::json!({
+            "model": self.model,
+            "input": input,
+            "stream": stream,
+        });
+        if let Some(ref tools) = tools_json {
+            b["tools"] = tools.clone();
+        }
+        b
+    }
+
     fn build_body_within_limit(
         &self,
         input: &mut Vec<serde_json::Value>,
         tools_json: &Option<serde_json::Value>,
         stream: bool,
     ) -> Result<serde_json::Value, AgentError> {
-        let make_body = |input: &[serde_json::Value]| -> serde_json::Value {
-            let mut b = serde_json::json!({
-                "model": self.model,
-                "input": input,
-                "stream": stream,
-            });
-            if let Some(ref tools) = tools_json {
-                b["tools"] = tools.clone();
-            }
-            b
-        };
+        let make_body = |input: &[serde_json::Value]| self.request_body(input, tools_json, stream);
 
         compact_items_to_request_limit(
             input,
@@ -518,6 +525,28 @@ impl Provider for ResponsesProvider {
 
     fn supports_vision(&self) -> bool {
         self.vision
+    }
+
+    fn request_budget_bytes(&self) -> Option<usize> {
+        (self.max_request_bytes != usize::MAX).then_some(self.max_request_bytes)
+    }
+
+    fn estimate_request_bytes(&self, request: &ChatRequest) -> Result<Option<usize>, AgentError> {
+        if self.request_budget_bytes().is_none() {
+            return Ok(None);
+        }
+
+        let input = self.messages_to_input(&request.messages);
+        let tools_json = request.tools.as_ref().and_then(|tools| {
+            if tools.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!(self.tools_to_responses_format(tools)))
+            }
+        });
+        serde_json::to_string(&self.request_body(&input, &tools_json, request.stream))
+            .map(|body| Some(body.len()))
+            .map_err(AgentError::from)
     }
 }
 

@@ -62,7 +62,10 @@ pub use provider::Provider;
 pub use providers::anthropic::AnthropicProvider;
 pub use providers::openai::OpenAiProvider;
 pub use providers::responses::ResponsesProvider;
-pub use runner::{run, ReferenceResolver, ResolvedReference, RunnerConfig, RunnerEvent, RunnerResult, ToolFilter};
+pub use runner::{
+    run, ReferenceResolver, ResolvedReference, RunnerConfig, RunnerEvent, RunnerResult, ToolFilter,
+    ToolResultBudget,
+};
 pub use sanitize::{sanitize_for_api, sanitize_message};
 pub use steering::Steering;
 pub use types::*;

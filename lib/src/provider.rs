@@ -33,6 +33,27 @@ pub trait Provider: Send + Sync {
         200_000
     }
 
+    /// Maximum serialized request body size this provider should receive.
+    ///
+    /// Providers without a known gateway/request cap return `None`.
+    fn request_budget_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Estimate the serialized HTTP request body size for this provider.
+    ///
+    /// Provider implementations should account for their actual wire format.
+    /// The default estimates the generic `ChatRequest` shape.
+    fn estimate_request_bytes(&self, request: &ChatRequest) -> Result<Option<usize>, AgentError> {
+        if self.request_budget_bytes().is_none() {
+            return Ok(None);
+        }
+
+        serde_json::to_string(request)
+            .map(|body| Some(body.len()))
+            .map_err(AgentError::from)
+    }
+
     /// Whether this provider/model supports vision (image content parts).
     fn supports_vision(&self) -> bool {
         false

@@ -139,6 +139,33 @@ impl OpenAiProvider {
 
     /// Build the JSON request body, compacting older conversation messages if
     /// the serialized size exceeds `max_request_bytes`.
+    fn request_body(
+        &self,
+        messages: &[ChatMessage],
+        tools: &Option<Vec<Tool>>,
+        stream: bool,
+        response_format: &Option<ResponseFormat>,
+    ) -> Result<serde_json::Value, AgentError> {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": stream,
+            "tools": tools,
+        });
+
+        if stream {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
+
+        if let Some(rf) = response_format {
+            body["response_format"] = serde_json::to_value(rf).map_err(|e| {
+                AgentError::Stream(format!("Failed to serialize response_format: {e}"))
+            })?;
+        }
+
+        Ok(body)
+    }
+
     fn build_body_within_limit(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -146,26 +173,8 @@ impl OpenAiProvider {
         stream: bool,
         response_format: &Option<ResponseFormat>,
     ) -> Result<serde_json::Value, AgentError> {
-        let make_body = |messages: &[ChatMessage]| -> Result<serde_json::Value, AgentError> {
-            let mut body = serde_json::json!({
-                "model": self.model,
-                "messages": messages,
-                "stream": stream,
-                "tools": tools,
-            });
-
-            if stream {
-                body["stream_options"] = serde_json::json!({"include_usage": true});
-            }
-
-            if let Some(rf) = response_format {
-                body["response_format"] = serde_json::to_value(rf).map_err(|e| {
-                    AgentError::Stream(format!("Failed to serialize response_format: {e}"))
-                })?;
-            }
-
-            Ok(body)
-        };
+        let make_body =
+            |messages: &[ChatMessage]| self.request_body(messages, tools, stream, response_format);
 
         compact_items_to_request_limit(
             messages,
@@ -396,6 +405,25 @@ impl Provider for OpenAiProvider {
 
     fn supports_vision(&self) -> bool {
         self.vision
+    }
+
+    fn request_budget_bytes(&self) -> Option<usize> {
+        (self.max_request_bytes != usize::MAX).then_some(self.max_request_bytes)
+    }
+
+    fn estimate_request_bytes(&self, request: &ChatRequest) -> Result<Option<usize>, AgentError> {
+        if self.request_budget_bytes().is_none() {
+            return Ok(None);
+        }
+
+        self.request_body(
+            &request.messages,
+            &request.tools,
+            request.stream,
+            &request.response_format,
+        )
+        .and_then(|body| serde_json::to_string(&body).map_err(AgentError::from))
+        .map(|body| Some(body.len()))
     }
 }
 
