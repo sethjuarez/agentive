@@ -3,6 +3,7 @@
 //! All types derive `Serialize`/`Deserialize` for easy JSON conversion.
 //! `ChatMessage` supports multimodal content via [`MessageContent`].
 
+use crate::state::{MemoryPromotionCandidate, TouchedResource, VerificationResult};
 use serde::{Deserialize, Serialize};
 
 // -- Message content (supports text and multimodal) --------------------------
@@ -76,6 +77,7 @@ pub struct ImageUrl {
 /// so existing executors returning `Result<String, String>` keep working
 /// when the signature is widened to `Result<ToolOutput, String>`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ToolOutput {
     /// Plain text tool result.
     Text(String),
@@ -86,12 +88,72 @@ pub enum ToolOutput {
         text: String,
         images: Vec<ContentPart>,
     },
+    /// A tool result decorated with host-neutral metadata for observability,
+    /// indexing, verification, and optional memory-promotion policy.
+    WithMetadata {
+        output: Box<ToolOutput>,
+        #[allow(clippy::struct_field_names)]
+        touched_resources: Vec<TouchedResource>,
+        verification_results: Vec<VerificationResult>,
+        memory_promotions: Vec<MemoryPromotionCandidate>,
+    },
 }
 
 impl ToolOutput {
     /// Create a tool output with text and associated images.
     pub fn with_images(text: impl Into<String>, images: Vec<ContentPart>) -> Self {
-        Self::WithImages { text: text.into(), images }
+        Self::WithImages {
+            text: text.into(),
+            images,
+        }
+    }
+
+    /// Attach a touched resource to this output.
+    pub fn with_touched_resource(self, resource: TouchedResource) -> Self {
+        self.with_metadata(vec![resource], Vec::new(), Vec::new())
+    }
+
+    /// Attach a verification result to this output.
+    pub fn with_verification_result(self, result: VerificationResult) -> Self {
+        self.with_metadata(Vec::new(), vec![result], Vec::new())
+    }
+
+    /// Attach a memory-promotion candidate to this output.
+    pub fn with_memory_promotion(self, candidate: MemoryPromotionCandidate) -> Self {
+        self.with_metadata(Vec::new(), Vec::new(), vec![candidate])
+    }
+
+    /// Attach all metadata channels to this output.
+    pub fn with_metadata(
+        self,
+        touched_resources: Vec<TouchedResource>,
+        verification_results: Vec<VerificationResult>,
+        memory_promotions: Vec<MemoryPromotionCandidate>,
+    ) -> Self {
+        match self {
+            Self::WithMetadata {
+                output,
+                touched_resources: mut existing_resources,
+                verification_results: mut existing_verifications,
+                memory_promotions: mut existing_promotions,
+            } => {
+                existing_resources.extend(touched_resources);
+                existing_verifications.extend(verification_results);
+                existing_promotions.extend(memory_promotions);
+                Self::WithMetadata {
+                    output,
+                    touched_resources: existing_resources,
+                    verification_results: existing_verifications,
+                    memory_promotions: existing_promotions,
+                }
+            }
+            output => Self::WithMetadata {
+                output: Box::new(output),
+                touched_resources,
+                verification_results,
+                memory_promotions,
+            },
+        }
     }
 
     /// Get the text portion of this output.
@@ -99,6 +161,7 @@ impl ToolOutput {
         match self {
             Self::Text(s) => s,
             Self::WithImages { text, .. } => text,
+            Self::WithMetadata { output, .. } => output.text(),
         }
     }
 
@@ -107,6 +170,38 @@ impl ToolOutput {
         match self {
             Self::Text(_) => None,
             Self::WithImages { images, .. } => Some(images),
+            Self::WithMetadata { output, .. } => output.images(),
+        }
+    }
+
+    /// Get touched resources attached to this output.
+    pub fn touched_resources(&self) -> &[TouchedResource] {
+        match self {
+            Self::WithMetadata {
+                touched_resources, ..
+            } => touched_resources,
+            _ => &[],
+        }
+    }
+
+    /// Get verification results attached to this output.
+    pub fn verification_results(&self) -> &[VerificationResult] {
+        match self {
+            Self::WithMetadata {
+                verification_results,
+                ..
+            } => verification_results,
+            _ => &[],
+        }
+    }
+
+    /// Get memory-promotion candidates attached to this output.
+    pub fn memory_promotions(&self) -> &[MemoryPromotionCandidate] {
+        match self {
+            Self::WithMetadata {
+                memory_promotions, ..
+            } => memory_promotions,
+            _ => &[],
         }
     }
 }
@@ -151,9 +246,7 @@ impl ChatMessage {
 
     /// Create a user message with text and image content parts.
     pub fn user_with_images(text: &str, images: Vec<ContentPart>) -> Self {
-        let mut parts = vec![ContentPart::Text {
-            text: text.into(),
-        }];
+        let mut parts = vec![ContentPart::Text { text: text.into() }];
         parts.extend(images);
         Self {
             role: "user".into(),

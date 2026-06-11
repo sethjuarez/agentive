@@ -46,9 +46,15 @@ use crate::cancel::CancellationToken;
 use crate::context::trim_to_context_window;
 use crate::error::AgentError;
 use crate::guardrails::{GuardrailResult, Guardrails};
+use crate::observability::{MemoryPromotionHook, TrajectorySink};
 use crate::provider::Provider;
 use crate::sanitize::sanitize_for_api;
+use crate::state::{
+    ErrorKind, FailureRecord, MemoryPromotionCandidate, MemoryPromotionOutcome, TouchedResource,
+    VerificationResult,
+};
 use crate::steering::Steering;
+use crate::trajectory::{ArgumentSummary, ModelUsage, TrajectoryEvent, TrajectoryMetadata};
 use crate::types::*;
 
 const MAX_REQUEST_BUDGET_COMPACTION_ROUNDS: usize = 16;
@@ -158,6 +164,12 @@ pub struct RunnerConfig {
     /// message so the LLM can see referenced materials (files, DB records, etc.).
     /// Resolution happens once per message — already-resolved messages are not re-scanned.
     pub reference_resolver: Option<ReferenceResolver>,
+    /// Optional best-effort sink for structured trajectory events. Sink errors
+    /// are logged and do not change the run outcome.
+    pub trajectory_sink: Option<Arc<dyn TrajectorySink>>,
+    /// Optional host-owned policy hook for memory promotion candidates emitted
+    /// by tools. Hook errors are recorded and do not change the run outcome.
+    pub memory_promotion_hook: Option<Arc<dyn MemoryPromotionHook>>,
 }
 
 impl Clone for RunnerConfig {
@@ -177,6 +189,8 @@ impl Clone for RunnerConfig {
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
             reference_resolver: self.reference_resolver.clone(),
+            trajectory_sink: self.trajectory_sink.clone(),
+            memory_promotion_hook: self.memory_promotion_hook.clone(),
         }
     }
 }
@@ -198,6 +212,11 @@ impl std::fmt::Debug for RunnerConfig {
             .field("provider_name", &self.provider_name)
             .field("model_name", &self.model_name)
             .field("reference_resolver", &self.reference_resolver.is_some())
+            .field("trajectory_sink", &self.trajectory_sink.is_some())
+            .field(
+                "memory_promotion_hook",
+                &self.memory_promotion_hook.is_some(),
+            )
             .finish()
     }
 }
@@ -219,6 +238,8 @@ impl Default for RunnerConfig {
             provider_name: None,
             model_name: None,
             reference_resolver: None,
+            trajectory_sink: None,
+            memory_promotion_hook: None,
         }
     }
 }
@@ -226,6 +247,7 @@ impl Default for RunnerConfig {
 /// Events emitted by the runner during execution.
 /// Apps use these to update UI, persist state, log, etc.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RunnerEvent {
     /// A text token streamed from the LLM.
     Token { token: String },
@@ -279,6 +301,31 @@ pub enum RunnerEvent {
         /// Agentive run ID for correlating logs, traces, and host commands.
         run_id: String,
         usage: Usage,
+    },
+    /// A tool or loop step touched a host-neutral resource.
+    ResourceTouched {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        resource: TouchedResource,
+    },
+    /// A tool or loop step recorded verification evidence.
+    VerificationRecorded {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        result: VerificationResult,
+    },
+    /// A tool or loop step suggested a memory promotion candidate.
+    MemoryPromotionSuggested {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        candidate: MemoryPromotionCandidate,
+    },
+    /// A host memory-promotion hook accepted, rejected, or deferred a candidate.
+    MemoryPromotionCompleted {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        candidate: MemoryPromotionCandidate,
+        outcome: MemoryPromotionOutcome,
     },
     /// The full message history was updated (after a tool round).
     /// Apps can use this to persist conversation state mid-run.
@@ -360,6 +407,18 @@ where
     let metadata = resolve_run_metadata(provider.as_ref(), &config);
     let run_start = std::time::Instant::now();
     let run_span = trace_run_span(&run_id, parent_run_id.as_deref(), &metadata);
+    let goal = if config.trajectory_sink.is_some() {
+        full_text_goal(&messages)
+    } else {
+        String::new()
+    };
+    emit_trajectory(
+        &config,
+        TrajectoryEvent::TurnStarted {
+            metadata: trajectory_metadata(&config, &run_id, None),
+            goal: redacted_goal_summary(&goal),
+        },
+    )?;
 
     let mut full_messages = messages;
     let mut new_messages: Vec<ChatMessage> = Vec::new();
@@ -468,6 +527,14 @@ where
 
         let request = build_request(&full_messages, &round_tools, &config, &metadata);
         let model_start = std::time::Instant::now();
+        emit_trajectory(
+            &config,
+            TrajectoryEvent::ModelCallStarted {
+                metadata: trajectory_metadata(&config, &run_id, Some(iteration)),
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+            },
+        )?;
 
         // Spawn provider in a separate task for concurrent streaming
         let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
@@ -593,6 +660,18 @@ where
         let response = assistant_response.ok_or_else(|| {
             AgentError::Stream("Provider finished without sending Done event".into())
         })?;
+        emit_trajectory(
+            &config,
+            TrajectoryEvent::ModelCallCompleted {
+                metadata: trajectory_metadata(&config, &run_id, Some(iteration)),
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                duration_ms: model_start.elapsed().as_millis() as u64,
+                success: true,
+                usage: response.usage.as_ref().map(model_usage_from_usage),
+                failure: None,
+            },
+        )?;
         on_event(RunnerEvent::ModelCall {
             run_id: run_id.clone(),
             parent_run_id: parent_run_id.clone(),
@@ -685,6 +764,14 @@ where
             messages: full_messages.clone(),
             elapsed_ms: run_start.elapsed().as_millis() as u64,
         });
+        emit_trajectory(
+            &config,
+            TrajectoryEvent::TurnCompleted {
+                metadata: trajectory_metadata(&config, &run_id, Some(iteration)),
+                success: true,
+                failure: None,
+            },
+        )?;
 
         return Ok(RunnerResult {
             messages: full_messages,
@@ -800,6 +887,201 @@ fn trace_tool_span(
         agentive.tool_call_id = %tool_call.id,
         tool.name = %tool_call.function.name,
     )
+}
+
+fn emit_trajectory(config: &RunnerConfig, event: TrajectoryEvent) -> Result<(), AgentError> {
+    if let Some(sink) = &config.trajectory_sink {
+        if let Err(err) = sink.record(event) {
+            log::warn!("Trajectory sink failed: {err}");
+        }
+    }
+    Ok(())
+}
+
+fn emit_tool_output_metadata<E>(
+    config: &RunnerConfig,
+    on_event: &E,
+    output: &ToolOutput,
+    run_id: &str,
+    iteration: usize,
+) -> Result<(), AgentError>
+where
+    E: Fn(RunnerEvent) + Send + Sync,
+{
+    for resource in output.touched_resources() {
+        on_event(RunnerEvent::ResourceTouched {
+            run_id: run_id.to_string(),
+            resource: resource.clone(),
+        });
+        emit_trajectory(
+            config,
+            TrajectoryEvent::ResourceTouched {
+                metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                resource: resource.clone(),
+            },
+        )?;
+    }
+
+    for result in output.verification_results() {
+        on_event(RunnerEvent::VerificationRecorded {
+            run_id: run_id.to_string(),
+            result: result.clone(),
+        });
+        emit_trajectory(
+            config,
+            TrajectoryEvent::VerificationRecorded {
+                metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                result: result.clone(),
+            },
+        )?;
+    }
+
+    for candidate in output.memory_promotions() {
+        let raw_candidate = candidate.clone();
+        let event_candidate = redacted_memory_candidate(&raw_candidate);
+        let hook_outcome = if let Some(hook) = &config.memory_promotion_hook {
+            match hook.consider(raw_candidate) {
+                Ok(outcome) => Some(safe_memory_outcome(outcome)),
+                Err(err) => Some(MemoryPromotionOutcome::Failed {
+                    failure_kind: ErrorKind::ToolError,
+                    reason: safe_failure_summary(&err),
+                }),
+            }
+        } else {
+            None
+        };
+
+        on_event(RunnerEvent::MemoryPromotionSuggested {
+            run_id: run_id.to_string(),
+            candidate: event_candidate.clone(),
+        });
+        emit_trajectory(
+            config,
+            TrajectoryEvent::MemoryPromotionSuggested {
+                metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                candidate: event_candidate.clone(),
+            },
+        )?;
+
+        if let Some(outcome) = hook_outcome {
+            on_event(RunnerEvent::MemoryPromotionCompleted {
+                run_id: run_id.to_string(),
+                candidate: event_candidate.clone(),
+                outcome: outcome.clone(),
+            });
+            emit_trajectory(
+                config,
+                TrajectoryEvent::MemoryPromotionCompleted {
+                    metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                    success: matches!(outcome, MemoryPromotionOutcome::Accepted { .. }),
+                    memory_id: match &outcome {
+                        MemoryPromotionOutcome::Accepted { memory_id } => memory_id.clone(),
+                        _ => None,
+                    },
+                    failure: memory_promotion_failure(&outcome),
+                },
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn trajectory_metadata(
+    config: &RunnerConfig,
+    run_id: &str,
+    iteration: Option<usize>,
+) -> TrajectoryMetadata {
+    let mut metadata = TrajectoryMetadata::new().with_run_id(run_id.to_string());
+    if let Some(parent_run_id) = &config.parent_run_id {
+        metadata = metadata.with_parent_run_id(parent_run_id.clone());
+    }
+    if let Some(iteration) = iteration {
+        metadata = metadata.with_iteration(iteration);
+    }
+    metadata
+}
+
+fn full_text_goal(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(ChatMessage::text)
+        .unwrap_or("")
+        .chars()
+        .take(500)
+        .collect()
+}
+
+fn redacted_goal_summary(goal: &str) -> String {
+    format!("[redacted; chars={}]", goal.chars().count())
+}
+
+fn redacted_memory_candidate(candidate: &MemoryPromotionCandidate) -> MemoryPromotionCandidate {
+    let mut redacted = MemoryPromotionCandidate::new(format!(
+        "[redacted; chars={}]",
+        candidate.content_summary.chars().count()
+    ));
+    redacted.category = candidate.category.clone();
+    redacted.confidence_basis_points = candidate.confidence_basis_points;
+    redacted
+}
+
+fn safe_failure_summary(summary: &str) -> String {
+    let sanitized = sanitize_for_api(summary);
+    let mut safe: String = sanitized.chars().take(500).collect();
+    if sanitized.chars().count() > 500 {
+        safe.push_str("... [truncated]");
+    }
+    safe
+}
+
+fn safe_memory_outcome(outcome: MemoryPromotionOutcome) -> MemoryPromotionOutcome {
+    match outcome {
+        MemoryPromotionOutcome::Accepted { memory_id } => MemoryPromotionOutcome::Accepted {
+            memory_id: memory_id.map(|id| safe_failure_summary(&id)),
+        },
+        MemoryPromotionOutcome::Rejected { reason } => MemoryPromotionOutcome::Rejected {
+            reason: reason.map(|reason| safe_failure_summary(&reason)),
+        },
+        MemoryPromotionOutcome::Deferred { reason } => MemoryPromotionOutcome::Deferred {
+            reason: reason.map(|reason| safe_failure_summary(&reason)),
+        },
+        MemoryPromotionOutcome::Failed {
+            failure_kind,
+            reason,
+        } => MemoryPromotionOutcome::Failed {
+            failure_kind,
+            reason: safe_failure_summary(&reason),
+        },
+    }
+}
+
+fn memory_promotion_failure(outcome: &MemoryPromotionOutcome) -> Option<FailureRecord> {
+    match outcome {
+        MemoryPromotionOutcome::Rejected { reason }
+        | MemoryPromotionOutcome::Deferred { reason } => reason.as_ref().map(|reason| {
+            FailureRecord::new(ErrorKind::ValidationFailed, safe_failure_summary(reason))
+                .with_source("memory_promotion")
+        }),
+        MemoryPromotionOutcome::Failed {
+            failure_kind,
+            reason,
+        } => Some(
+            FailureRecord::new(failure_kind.clone(), safe_failure_summary(reason))
+                .with_source("memory_promotion"),
+        ),
+        MemoryPromotionOutcome::Accepted { .. } => None,
+    }
+}
+
+fn model_usage_from_usage(usage: &Usage) -> ModelUsage {
+    ModelUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
 }
 
 async fn compact_to_request_budget<E>(
@@ -1067,6 +1349,15 @@ where
 {
     let mut results = Vec::with_capacity(tool_calls.len());
     for tc in tool_calls {
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_started(
+                tc.id.clone(),
+                tc.function.name.clone(),
+                ArgumentSummary::redacted(&tc.function.arguments),
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
         // Tool guardrail — check before execution
         if let GuardrailResult::Deny(reason) = guardrails.check_tool(tc) {
             let denied_msg = format!("Tool denied by guardrail: {}", reason);
@@ -1089,6 +1380,18 @@ where
             tool_future.instrument(trace_tool_span(_run_span, run_id, _metadata, tc, iteration));
         let (id, name, output) = tool_future.await?;
         let elapsed_ms = tool_start.elapsed().as_millis() as u64;
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_completed(
+                id.clone(),
+                name.clone(),
+                elapsed_ms,
+                true,
+                None,
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
+        emit_tool_output_metadata(config, on_event, &output, run_id, iteration)?;
         let sanitized_text = if config.sanitize_tool_results {
             sanitize_for_api(output.text())
         } else {
@@ -1142,6 +1445,15 @@ where
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|tc| {
+            let _ = emit_trajectory(
+                config,
+                TrajectoryEvent::tool_call_started(
+                    tc.id.clone(),
+                    tc.function.name.clone(),
+                    ArgumentSummary::redacted(&tc.function.arguments),
+                    trajectory_metadata(config, run_id, Some(iteration)),
+                ),
+            );
             let tc_clone = tc.clone();
             #[cfg(feature = "tracing")]
             let run_id = run_id.to_string();
@@ -1180,6 +1492,18 @@ where
     let mut messages = Vec::with_capacity(tool_calls.len());
     for res in results {
         let (id, name, output, elapsed_ms) = res?;
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_completed(
+                id.clone(),
+                name.clone(),
+                elapsed_ms,
+                true,
+                None,
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
+        emit_tool_output_metadata(config, on_event, &output, run_id, iteration)?;
         let sanitized_text = if config.sanitize_tool_results {
             sanitize_for_api(output.text())
         } else {
