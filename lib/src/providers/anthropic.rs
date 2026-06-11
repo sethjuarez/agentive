@@ -444,6 +444,10 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn context_budget_chars(&self) -> usize {
         self.context_budget
     }

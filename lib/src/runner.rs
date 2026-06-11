@@ -39,19 +39,40 @@ use futures_util::future::join_all;
 use futures_util::FutureExt;
 use regex::Regex;
 use tokio::sync::mpsc;
+#[cfg(feature = "tracing")]
+use tracing::Instrument as _;
 
 use crate::cancel::CancellationToken;
 use crate::context::trim_to_context_window;
 use crate::error::AgentError;
 use crate::guardrails::{GuardrailResult, Guardrails};
+use crate::observability::{MemoryPromotionHook, TrajectorySink};
 use crate::provider::Provider;
 use crate::sanitize::sanitize_for_api;
+use crate::state::{
+    ErrorKind, FailureRecord, MemoryPromotionCandidate, MemoryPromotionOutcome, TouchedResource,
+    VerificationResult,
+};
 use crate::steering::Steering;
+use crate::trajectory::{ArgumentSummary, ModelUsage, TrajectoryEvent, TrajectoryMetadata};
 use crate::types::*;
 
 const MAX_REQUEST_BUDGET_COMPACTION_ROUNDS: usize = 16;
 const REQUEST_BUDGET_TARGET_PERCENT: usize = 95;
 const SUMMARY_PREFIX: &str = "[Earlier conversation summary";
+
+#[derive(Debug, Clone)]
+struct RunMetadata {
+    provider: String,
+    #[cfg(feature = "tracing")]
+    system: String,
+    model: String,
+}
+
+#[cfg(feature = "tracing")]
+type RunSpan = tracing::Span;
+#[cfg(not(feature = "tracing"))]
+struct RunSpan;
 
 /// A per-round tool filter function. Receives the current message history
 /// and returns the set of tools to offer the LLM for that round.
@@ -132,12 +153,23 @@ pub struct RunnerConfig {
     /// (e.g., via a delegate_to_agent tool), set this to the parent's run_id
     /// so traces can reconstruct the full call tree.
     pub parent_run_id: Option<String>,
+    /// Optional provider display name for telemetry. Defaults to `Provider::name()`.
+    pub provider_name: Option<String>,
+    /// Optional model/deployment display name for telemetry and `ChatRequest::model`.
+    /// Defaults to `Provider::model()` when available.
+    pub model_name: Option<String>,
     /// Optional reference resolver for `@reference` syntax in user messages.
     /// When set, the runner scans user messages for `@name` or `@"quoted name"`
     /// patterns, calls this resolver, and appends the resolved content to the
     /// message so the LLM can see referenced materials (files, DB records, etc.).
     /// Resolution happens once per message — already-resolved messages are not re-scanned.
     pub reference_resolver: Option<ReferenceResolver>,
+    /// Optional best-effort sink for structured trajectory events. Sink errors
+    /// are logged and do not change the run outcome.
+    pub trajectory_sink: Option<Arc<dyn TrajectorySink>>,
+    /// Optional host-owned policy hook for memory promotion candidates emitted
+    /// by tools. Hook errors are recorded and do not change the run outcome.
+    pub memory_promotion_hook: Option<Arc<dyn MemoryPromotionHook>>,
 }
 
 impl Clone for RunnerConfig {
@@ -154,7 +186,11 @@ impl Clone for RunnerConfig {
             tool_filter: self.tool_filter.clone(),
             run_id: self.run_id.clone(),
             parent_run_id: self.parent_run_id.clone(),
+            provider_name: self.provider_name.clone(),
+            model_name: self.model_name.clone(),
             reference_resolver: self.reference_resolver.clone(),
+            trajectory_sink: self.trajectory_sink.clone(),
+            memory_promotion_hook: self.memory_promotion_hook.clone(),
         }
     }
 }
@@ -173,7 +209,14 @@ impl std::fmt::Debug for RunnerConfig {
             .field("tool_filter", &self.tool_filter.is_some())
             .field("run_id", &self.run_id)
             .field("parent_run_id", &self.parent_run_id)
+            .field("provider_name", &self.provider_name)
+            .field("model_name", &self.model_name)
             .field("reference_resolver", &self.reference_resolver.is_some())
+            .field("trajectory_sink", &self.trajectory_sink.is_some())
+            .field(
+                "memory_promotion_hook",
+                &self.memory_promotion_hook.is_some(),
+            )
             .finish()
     }
 }
@@ -192,7 +235,11 @@ impl Default for RunnerConfig {
             tool_filter: None,
             run_id: None,
             parent_run_id: None,
+            provider_name: None,
+            model_name: None,
             reference_resolver: None,
+            trajectory_sink: None,
+            memory_promotion_hook: None,
         }
     }
 }
@@ -200,6 +247,7 @@ impl Default for RunnerConfig {
 /// Events emitted by the runner during execution.
 /// Apps use these to update UI, persist state, log, etc.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RunnerEvent {
     /// A text token streamed from the LLM.
     Token { token: String },
@@ -209,6 +257,8 @@ pub enum RunnerEvent {
     Status { message: String },
     /// A tool is being called.
     ToolCallStart {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
         name: String,
         arguments: String,
         /// The LLM-assigned tool call ID (e.g., "call_abc123").
@@ -218,6 +268,8 @@ pub enum RunnerEvent {
     },
     /// A tool returned a result.
     ToolResult {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
         name: String,
         result: String,
         /// The LLM-assigned tool call ID, matching the corresponding ToolCallStart.
@@ -227,20 +279,78 @@ pub enum RunnerEvent {
         /// Which iteration of the runner loop this occurred in (0-based).
         iteration: usize,
     },
+    /// A model call completed.
+    ModelCall {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        /// Parent run ID when this run was delegated by another run.
+        parent_run_id: Option<String>,
+        /// Provider display name used for telemetry.
+        provider: String,
+        /// Model or deployment display name used for telemetry.
+        model: String,
+        /// Which iteration of the runner loop this occurred in (0-based).
+        iteration: usize,
+        /// Wall-clock time the model call took, in milliseconds.
+        elapsed_ms: u64,
+        /// Token usage for this model call, when reported by the provider.
+        usage: Option<Usage>,
+    },
     /// Token usage for a single LLM call.
-    Usage { usage: Usage },
+    Usage {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        usage: Usage,
+    },
+    /// A tool or loop step touched a host-neutral resource.
+    ResourceTouched {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        resource: TouchedResource,
+    },
+    /// A tool or loop step recorded verification evidence.
+    VerificationRecorded {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        result: VerificationResult,
+    },
+    /// A tool or loop step suggested a memory promotion candidate.
+    MemoryPromotionSuggested {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        candidate: MemoryPromotionCandidate,
+    },
+    /// A host memory-promotion hook accepted, rejected, or deferred a candidate.
+    MemoryPromotionCompleted {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        candidate: MemoryPromotionCandidate,
+        outcome: MemoryPromotionOutcome,
+    },
     /// The full message history was updated (after a tool round).
     /// Apps can use this to persist conversation state mid-run.
-    MessagesUpdated { messages: Vec<ChatMessage> },
+    MessagesUpdated {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        messages: Vec<ChatMessage>,
+    },
     /// The runner completed successfully.
     Done {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        /// Parent run ID when this run was delegated by another run.
+        parent_run_id: Option<String>,
         response: String,
         messages: Vec<ChatMessage>,
         /// Total wall-clock time for the entire run, in milliseconds.
         elapsed_ms: u64,
     },
     /// An error occurred.
-    Error { message: String },
+    Error {
+        /// Agentive run ID for correlating logs, traces, and host commands.
+        run_id: String,
+        message: String,
+    },
 }
 
 /// Result of running the agentic loop.
@@ -294,7 +404,21 @@ where
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let parent_run_id = config.parent_run_id.clone();
+    let metadata = resolve_run_metadata(provider.as_ref(), &config);
     let run_start = std::time::Instant::now();
+    let run_span = trace_run_span(&run_id, parent_run_id.as_deref(), &metadata);
+    let goal = if config.trajectory_sink.is_some() {
+        full_text_goal(&messages)
+    } else {
+        String::new()
+    };
+    emit_trajectory(
+        &config,
+        TrajectoryEvent::TurnStarted {
+            metadata: trajectory_metadata(&config, &run_id, None),
+            goal: redacted_goal_summary(&goal),
+        },
+    )?;
 
     let mut full_messages = messages;
     let mut new_messages: Vec<ChatMessage> = Vec::new();
@@ -390,6 +514,7 @@ where
                 provider.as_ref(),
                 &round_tools,
                 &config,
+                &metadata,
                 &cancel,
                 &on_event,
             )
@@ -400,15 +525,28 @@ where
             return Err(AgentError::Guardrailed(reason));
         }
 
-        let request = build_request(&full_messages, &round_tools, &config);
+        let request = build_request(&full_messages, &round_tools, &config, &metadata);
+        let model_start = std::time::Instant::now();
+        emit_trajectory(
+            &config,
+            TrajectoryEvent::ModelCallStarted {
+                metadata: trajectory_metadata(&config, &run_id, Some(iteration)),
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+            },
+        )?;
 
         // Spawn provider in a separate task for concurrent streaming
         let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
         let provider_clone = provider.clone();
         let cancel_clone = cancel.clone();
 
-        let provider_handle =
-            tokio::spawn(async move { provider_clone.chat(request, tx, &cancel_clone).await });
+        let provider_future = async move { provider_clone.chat(request, tx, &cancel_clone).await };
+        #[cfg(feature = "tracing")]
+        let provider_future = provider_future.instrument(trace_model_span(
+            &run_span, &run_id, &metadata, iteration, false,
+        ));
+        let provider_handle = tokio::spawn(provider_future);
 
         // Read events as they arrive
         let mut assistant_response: Option<ChatResponse> = None;
@@ -427,6 +565,7 @@ where
                 }
                 ChatEvent::ToolCallStart { tool_call } => {
                     on_event(RunnerEvent::ToolCallStart {
+                        run_id: run_id.clone(),
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
                         tool_call_id: tool_call.id.clone(),
@@ -456,15 +595,19 @@ where
                     });
 
                     // Retry once
-                    let request2 = build_request(&full_messages, &round_tools, &config);
+                    let request2 = build_request(&full_messages, &round_tools, &config, &metadata);
 
                     let (tx2, mut rx2) = mpsc::channel::<ChatEvent>(64);
                     let provider_clone2 = provider.clone();
                     let cancel_clone2 = cancel.clone();
 
-                    let handle2 = tokio::spawn(async move {
-                        provider_clone2.chat(request2, tx2, &cancel_clone2).await
-                    });
+                    let retry_future =
+                        async move { provider_clone2.chat(request2, tx2, &cancel_clone2).await };
+                    #[cfg(feature = "tracing")]
+                    let retry_future = retry_future.instrument(trace_model_span(
+                        &run_span, &run_id, &metadata, iteration, true,
+                    ));
+                    let handle2 = tokio::spawn(retry_future);
 
                     while let Some(event) = rx2.recv().await {
                         match event {
@@ -476,6 +619,7 @@ where
                             }
                             ChatEvent::ToolCallStart { tool_call } => {
                                 on_event(RunnerEvent::ToolCallStart {
+                                    run_id: run_id.clone(),
                                     name: tool_call.function.name.clone(),
                                     arguments: tool_call.function.arguments.clone(),
                                     tool_call_id: tool_call.id.clone(),
@@ -498,6 +642,7 @@ where
                         })?
                         .map_err(|e| {
                             on_event(RunnerEvent::Error {
+                                run_id: run_id.clone(),
                                 message: format!("Retry also failed: {}", e),
                             });
                             e
@@ -515,11 +660,33 @@ where
         let response = assistant_response.ok_or_else(|| {
             AgentError::Stream("Provider finished without sending Done event".into())
         })?;
+        emit_trajectory(
+            &config,
+            TrajectoryEvent::ModelCallCompleted {
+                metadata: trajectory_metadata(&config, &run_id, Some(iteration)),
+                provider: metadata.provider.clone(),
+                model: metadata.model.clone(),
+                duration_ms: model_start.elapsed().as_millis() as u64,
+                success: true,
+                usage: response.usage.as_ref().map(model_usage_from_usage),
+                failure: None,
+            },
+        )?;
+        on_event(RunnerEvent::ModelCall {
+            run_id: run_id.clone(),
+            parent_run_id: parent_run_id.clone(),
+            provider: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            iteration,
+            elapsed_ms: model_start.elapsed().as_millis() as u64,
+            usage: response.usage.clone(),
+        });
 
         // Track usage
         if let Some(usage) = &response.usage {
             total_usage += usage.clone();
             on_event(RunnerEvent::Usage {
+                run_id: run_id.clone(),
                 usage: usage.clone(),
             });
         }
@@ -546,6 +713,9 @@ where
                         tool_calls,
                         &tool_executor,
                         &config,
+                        &run_id,
+                        &metadata,
+                        &run_span,
                         &guardrails,
                         &on_event,
                         iteration,
@@ -556,6 +726,9 @@ where
                         tool_calls,
                         &tool_executor,
                         &config,
+                        &run_id,
+                        &metadata,
+                        &run_span,
                         &guardrails,
                         &on_event,
                         iteration,
@@ -570,6 +743,7 @@ where
 
                 // Emit updated messages for persistence
                 on_event(RunnerEvent::MessagesUpdated {
+                    run_id: run_id.clone(),
                     messages: full_messages.clone(),
                 });
 
@@ -584,10 +758,20 @@ where
         let final_text = response.message.text().unwrap_or("").to_string();
 
         on_event(RunnerEvent::Done {
+            run_id: run_id.clone(),
+            parent_run_id: parent_run_id.clone(),
             response: final_text.clone(),
             messages: full_messages.clone(),
             elapsed_ms: run_start.elapsed().as_millis() as u64,
         });
+        emit_trajectory(
+            &config,
+            TrajectoryEvent::TurnCompleted {
+                metadata: trajectory_metadata(&config, &run_id, Some(iteration)),
+                success: true,
+                failure: None,
+            },
+        )?;
 
         return Ok(RunnerResult {
             messages: full_messages,
@@ -606,10 +790,11 @@ fn build_request(
     messages: &[ChatMessage],
     round_tools: &[Tool],
     config: &RunnerConfig,
+    metadata: &RunMetadata,
 ) -> ChatRequest {
     ChatRequest {
         messages: messages.to_vec(),
-        model: String::new(),
+        model: metadata.model.clone(),
         tools: if round_tools.is_empty() {
             None
         } else {
@@ -620,11 +805,291 @@ fn build_request(
     }
 }
 
+fn resolve_run_metadata(provider: &dyn Provider, config: &RunnerConfig) -> RunMetadata {
+    let provider_name = config
+        .provider_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| provider.name())
+        .to_string();
+    let model_name = config
+        .model_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| provider.model().filter(|model| !model.trim().is_empty()))
+        .unwrap_or("")
+        .to_string();
+
+    RunMetadata {
+        provider: provider_name,
+        #[cfg(feature = "tracing")]
+        system: provider.name().to_string(),
+        model: model_name,
+    }
+}
+
+fn trace_run_span(run_id: &str, parent_run_id: Option<&str>, metadata: &RunMetadata) -> RunSpan {
+    #[cfg(not(feature = "tracing"))]
+    {
+        let _ = (run_id, parent_run_id, metadata);
+        RunSpan
+    }
+    #[cfg(feature = "tracing")]
+    {
+        tracing::info_span!(
+            "agentive.run",
+            agentive.run_id = %run_id,
+            agentive.parent_run_id = parent_run_id.unwrap_or(""),
+            agentive.provider = %metadata.provider,
+            agentive.model = %metadata.model,
+            gen_ai.system = %metadata.system,
+            gen_ai.request.model = %metadata.model,
+        )
+    }
+}
+
+#[cfg(feature = "tracing")]
+fn trace_model_span(
+    run_span: &RunSpan,
+    run_id: &str,
+    metadata: &RunMetadata,
+    iteration: usize,
+    retry: bool,
+) -> tracing::Span {
+    tracing::info_span!(
+        parent: run_span,
+        "agentive.model_call",
+        agentive.run_id = %run_id,
+        agentive.provider = %metadata.provider,
+        agentive.model = %metadata.model,
+        agentive.iteration = iteration,
+        agentive.retry = retry,
+        gen_ai.system = %metadata.system,
+        gen_ai.request.model = %metadata.model,
+    )
+}
+
+#[cfg(feature = "tracing")]
+fn trace_tool_span(
+    run_span: &RunSpan,
+    run_id: &str,
+    metadata: &RunMetadata,
+    tool_call: &ToolCall,
+    iteration: usize,
+) -> tracing::Span {
+    tracing::info_span!(
+        parent: run_span,
+        "agentive.tool_call",
+        agentive.run_id = %run_id,
+        agentive.provider = %metadata.provider,
+        agentive.model = %metadata.model,
+        agentive.iteration = iteration,
+        agentive.tool_call_id = %tool_call.id,
+        tool.name = %tool_call.function.name,
+    )
+}
+
+fn emit_trajectory(config: &RunnerConfig, event: TrajectoryEvent) -> Result<(), AgentError> {
+    if let Some(sink) = &config.trajectory_sink {
+        if let Err(err) = sink.record(event) {
+            log::warn!("Trajectory sink failed: {err}");
+        }
+    }
+    Ok(())
+}
+
+fn emit_tool_output_metadata<E>(
+    config: &RunnerConfig,
+    on_event: &E,
+    output: &ToolOutput,
+    run_id: &str,
+    iteration: usize,
+) -> Result<(), AgentError>
+where
+    E: Fn(RunnerEvent) + Send + Sync,
+{
+    for resource in output.touched_resources() {
+        on_event(RunnerEvent::ResourceTouched {
+            run_id: run_id.to_string(),
+            resource: resource.clone(),
+        });
+        emit_trajectory(
+            config,
+            TrajectoryEvent::ResourceTouched {
+                metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                resource: resource.clone(),
+            },
+        )?;
+    }
+
+    for result in output.verification_results() {
+        on_event(RunnerEvent::VerificationRecorded {
+            run_id: run_id.to_string(),
+            result: result.clone(),
+        });
+        emit_trajectory(
+            config,
+            TrajectoryEvent::VerificationRecorded {
+                metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                result: result.clone(),
+            },
+        )?;
+    }
+
+    for candidate in output.memory_promotions() {
+        let raw_candidate = candidate.clone();
+        let event_candidate = redacted_memory_candidate(&raw_candidate);
+        let hook_outcome = if let Some(hook) = &config.memory_promotion_hook {
+            match hook.consider(raw_candidate) {
+                Ok(outcome) => Some(safe_memory_outcome(outcome)),
+                Err(err) => Some(MemoryPromotionOutcome::Failed {
+                    failure_kind: ErrorKind::ToolError,
+                    reason: safe_failure_summary(&err),
+                }),
+            }
+        } else {
+            None
+        };
+
+        on_event(RunnerEvent::MemoryPromotionSuggested {
+            run_id: run_id.to_string(),
+            candidate: event_candidate.clone(),
+        });
+        emit_trajectory(
+            config,
+            TrajectoryEvent::MemoryPromotionSuggested {
+                metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                candidate: event_candidate.clone(),
+            },
+        )?;
+
+        if let Some(outcome) = hook_outcome {
+            on_event(RunnerEvent::MemoryPromotionCompleted {
+                run_id: run_id.to_string(),
+                candidate: event_candidate.clone(),
+                outcome: outcome.clone(),
+            });
+            emit_trajectory(
+                config,
+                TrajectoryEvent::MemoryPromotionCompleted {
+                    metadata: trajectory_metadata(config, run_id, Some(iteration)),
+                    success: matches!(outcome, MemoryPromotionOutcome::Accepted { .. }),
+                    memory_id: match &outcome {
+                        MemoryPromotionOutcome::Accepted { memory_id } => memory_id.clone(),
+                        _ => None,
+                    },
+                    failure: memory_promotion_failure(&outcome),
+                },
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn trajectory_metadata(
+    config: &RunnerConfig,
+    run_id: &str,
+    iteration: Option<usize>,
+) -> TrajectoryMetadata {
+    let mut metadata = TrajectoryMetadata::new().with_run_id(run_id.to_string());
+    if let Some(parent_run_id) = &config.parent_run_id {
+        metadata = metadata.with_parent_run_id(parent_run_id.clone());
+    }
+    if let Some(iteration) = iteration {
+        metadata = metadata.with_iteration(iteration);
+    }
+    metadata
+}
+
+fn full_text_goal(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(ChatMessage::text)
+        .unwrap_or("")
+        .chars()
+        .take(500)
+        .collect()
+}
+
+fn redacted_goal_summary(goal: &str) -> String {
+    format!("[redacted; chars={}]", goal.chars().count())
+}
+
+fn redacted_memory_candidate(candidate: &MemoryPromotionCandidate) -> MemoryPromotionCandidate {
+    let mut redacted = MemoryPromotionCandidate::new(format!(
+        "[redacted; chars={}]",
+        candidate.content_summary.chars().count()
+    ));
+    redacted.category = candidate.category.clone();
+    redacted.confidence_basis_points = candidate.confidence_basis_points;
+    redacted
+}
+
+fn safe_failure_summary(summary: &str) -> String {
+    let sanitized = sanitize_for_api(summary);
+    let mut safe: String = sanitized.chars().take(500).collect();
+    if sanitized.chars().count() > 500 {
+        safe.push_str("... [truncated]");
+    }
+    safe
+}
+
+fn safe_memory_outcome(outcome: MemoryPromotionOutcome) -> MemoryPromotionOutcome {
+    match outcome {
+        MemoryPromotionOutcome::Accepted { memory_id } => MemoryPromotionOutcome::Accepted {
+            memory_id: memory_id.map(|id| safe_failure_summary(&id)),
+        },
+        MemoryPromotionOutcome::Rejected { reason } => MemoryPromotionOutcome::Rejected {
+            reason: reason.map(|reason| safe_failure_summary(&reason)),
+        },
+        MemoryPromotionOutcome::Deferred { reason } => MemoryPromotionOutcome::Deferred {
+            reason: reason.map(|reason| safe_failure_summary(&reason)),
+        },
+        MemoryPromotionOutcome::Failed {
+            failure_kind,
+            reason,
+        } => MemoryPromotionOutcome::Failed {
+            failure_kind,
+            reason: safe_failure_summary(&reason),
+        },
+    }
+}
+
+fn memory_promotion_failure(outcome: &MemoryPromotionOutcome) -> Option<FailureRecord> {
+    match outcome {
+        MemoryPromotionOutcome::Rejected { reason }
+        | MemoryPromotionOutcome::Deferred { reason } => reason.as_ref().map(|reason| {
+            FailureRecord::new(ErrorKind::ValidationFailed, safe_failure_summary(reason))
+                .with_source("memory_promotion")
+        }),
+        MemoryPromotionOutcome::Failed {
+            failure_kind,
+            reason,
+        } => Some(
+            FailureRecord::new(failure_kind.clone(), safe_failure_summary(reason))
+                .with_source("memory_promotion"),
+        ),
+        MemoryPromotionOutcome::Accepted { .. } => None,
+    }
+}
+
+fn model_usage_from_usage(usage: &Usage) -> ModelUsage {
+    ModelUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
+}
+
 async fn compact_to_request_budget<E>(
     messages: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     round_tools: &[Tool],
     config: &RunnerConfig,
+    metadata: &RunMetadata,
     cancel: &CancellationToken,
     on_event: &E,
 ) -> Result<(), AgentError>
@@ -638,7 +1103,7 @@ where
     let mut dropped_all = Vec::new();
 
     for _ in 0..MAX_REQUEST_BUDGET_COMPACTION_ROUNDS {
-        let request = build_request(messages, round_tools, config);
+        let request = build_request(messages, round_tools, config, metadata);
         let Some(size) = provider.estimate_request_bytes(&request)? else {
             return Ok(());
         };
@@ -685,7 +1150,7 @@ where
         );
     }
 
-    let request = build_request(messages, round_tools, config);
+    let request = build_request(messages, round_tools, config, metadata);
     if let Some(size) = provider.estimate_request_bytes(&request)? {
         if size > budget {
             return Err(AgentError::Stream(format!(
@@ -870,6 +1335,9 @@ async fn execute_tools_sequential<F, Fut, E>(
     tool_calls: &[ToolCall],
     tool_executor: &F,
     config: &RunnerConfig,
+    run_id: &str,
+    _metadata: &RunMetadata,
+    _run_span: &RunSpan,
     guardrails: &Guardrails,
     on_event: &E,
     iteration: usize,
@@ -881,10 +1349,20 @@ where
 {
     let mut results = Vec::with_capacity(tool_calls.len());
     for tc in tool_calls {
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_started(
+                tc.id.clone(),
+                tc.function.name.clone(),
+                ArgumentSummary::redacted(&tc.function.arguments),
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
         // Tool guardrail — check before execution
         if let GuardrailResult::Deny(reason) = guardrails.check_tool(tc) {
             let denied_msg = format!("Tool denied by guardrail: {}", reason);
             on_event(RunnerEvent::ToolResult {
+                run_id: run_id.to_string(),
                 name: tc.function.name.clone(),
                 result: denied_msg.clone(),
                 tool_call_id: tc.id.clone(),
@@ -896,8 +1374,24 @@ where
         }
 
         let tool_start = std::time::Instant::now();
-        let (id, name, output) = execute_tool_safe(tc.clone(), tool_executor).await?;
+        let tool_future = execute_tool_safe(tc.clone(), tool_executor);
+        #[cfg(feature = "tracing")]
+        let tool_future =
+            tool_future.instrument(trace_tool_span(_run_span, run_id, _metadata, tc, iteration));
+        let (id, name, output) = tool_future.await?;
         let elapsed_ms = tool_start.elapsed().as_millis() as u64;
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_completed(
+                id.clone(),
+                name.clone(),
+                elapsed_ms,
+                true,
+                None,
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
+        emit_tool_output_metadata(config, on_event, &output, run_id, iteration)?;
         let sanitized_text = if config.sanitize_tool_results {
             sanitize_for_api(output.text())
         } else {
@@ -905,6 +1399,7 @@ where
         };
         let clean_text = apply_tool_result_budget(&sanitized_text, &config.tool_result_budget);
         on_event(RunnerEvent::ToolResult {
+            run_id: run_id.to_string(),
             name,
             result: clean_text.clone(),
             tool_call_id: id.clone(),
@@ -935,6 +1430,9 @@ async fn execute_tools_parallel<F, Fut, E>(
     tool_calls: &[ToolCall],
     tool_executor: &F,
     config: &RunnerConfig,
+    run_id: &str,
+    _metadata: &RunMetadata,
+    _run_span: &RunSpan,
     guardrails: &Guardrails,
     on_event: &E,
     iteration: usize,
@@ -947,12 +1445,27 @@ where
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|tc| {
+            let _ = emit_trajectory(
+                config,
+                TrajectoryEvent::tool_call_started(
+                    tc.id.clone(),
+                    tc.function.name.clone(),
+                    ArgumentSummary::redacted(&tc.function.arguments),
+                    trajectory_metadata(config, run_id, Some(iteration)),
+                ),
+            );
             let tc_clone = tc.clone();
+            #[cfg(feature = "tracing")]
+            let run_id = run_id.to_string();
+            #[cfg(feature = "tracing")]
+            let metadata = _metadata.clone();
+            #[cfg(feature = "tracing")]
+            let span = trace_tool_span(_run_span, &run_id, &metadata, &tc_clone, iteration);
             let denied = match guardrails.check_tool(tc) {
                 GuardrailResult::Deny(reason) => Some(reason),
                 GuardrailResult::Allow => None,
             };
-            async move {
+            let fut = async move {
                 let tool_start = std::time::Instant::now();
                 if let Some(reason) = denied {
                     let elapsed_ms = tool_start.elapsed().as_millis() as u64;
@@ -967,7 +1480,10 @@ where
                     let elapsed_ms = tool_start.elapsed().as_millis() as u64;
                     result.map(|(id, name, output)| (id, name, output, elapsed_ms))
                 }
-            }
+            };
+            #[cfg(feature = "tracing")]
+            let fut = fut.instrument(span);
+            fut
         })
         .collect();
 
@@ -976,6 +1492,18 @@ where
     let mut messages = Vec::with_capacity(tool_calls.len());
     for res in results {
         let (id, name, output, elapsed_ms) = res?;
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_completed(
+                id.clone(),
+                name.clone(),
+                elapsed_ms,
+                true,
+                None,
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
+        emit_tool_output_metadata(config, on_event, &output, run_id, iteration)?;
         let sanitized_text = if config.sanitize_tool_results {
             sanitize_for_api(output.text())
         } else {
@@ -983,6 +1511,7 @@ where
         };
         let clean_text = apply_tool_result_budget(&sanitized_text, &config.tool_result_budget);
         on_event(RunnerEvent::ToolResult {
+            run_id: run_id.to_string(),
             name,
             result: clean_text.clone(),
             tool_call_id: id.clone(),
@@ -1233,6 +1762,53 @@ mod tests {
 
         fn name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct MetadataMockProvider {
+        inner: MockProvider,
+        provider_name: &'static str,
+        model_name: Option<&'static str>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl MetadataMockProvider {
+        fn new(
+            responses: Vec<ChatResponse>,
+            provider_name: &'static str,
+            model_name: Option<&'static str>,
+        ) -> Self {
+            Self {
+                inner: MockProvider::new(responses),
+                provider_name,
+                model_name,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for MetadataMockProvider {
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            cancel: &CancellationToken,
+        ) -> Result<(), AgentError> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.inner.chat(request, tx, cancel).await
+        }
+
+        fn name(&self) -> &str {
+            self.provider_name
+        }
+
+        fn model(&self) -> Option<&str> {
+            self.model_name
         }
     }
 
@@ -3332,6 +3908,128 @@ mod tests {
         assert!(done.is_some(), "Should have a Done event");
         if let RunnerEvent::Done { elapsed_ms, .. } = done.unwrap() {
             assert!(*elapsed_ms < 5000, "Run should complete quickly in test");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_model_metadata_populates_request_and_model_event() {
+        let provider = Arc::new(MetadataMockProvider::new(
+            vec![ChatResponse {
+                message: ChatMessage::assistant("done"),
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                }),
+            }],
+            "azure_openai",
+            Some("gpt-5.4"),
+        ));
+
+        let events = Arc::new(Mutex::new(Vec::<RunnerEvent>::new()));
+        let events_clone = events.clone();
+
+        let result = run(
+            provider.clone(),
+            vec![ChatMessage::user("hi")],
+            vec![],
+            |_| async { Ok(ToolOutput::from("")) },
+            RunnerConfig {
+                run_id: Some("metadata-run".into()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            move |event| {
+                events_clone.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.run_id, "metadata-run");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "gpt-5.4");
+
+        let events = events.lock().unwrap();
+        let model_call = events
+            .iter()
+            .find(|event| matches!(event, RunnerEvent::ModelCall { .. }))
+            .expect("expected model call event");
+        if let RunnerEvent::ModelCall {
+            run_id,
+            provider,
+            model,
+            usage,
+            ..
+        } = model_call
+        {
+            assert_eq!(run_id, "metadata-run");
+            assert_eq!(provider, "azure_openai");
+            assert_eq!(model, "gpt-5.4");
+            assert_eq!(usage.as_ref().map(|u| u.total_tokens), Some(15));
+        }
+
+        let done = events
+            .iter()
+            .find(|event| matches!(event, RunnerEvent::Done { .. }))
+            .expect("expected done event");
+        if let RunnerEvent::Done { run_id, .. } = done {
+            assert_eq!(run_id, "metadata-run");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_runner_config_model_metadata_overrides_provider_defaults() {
+        let provider = Arc::new(MetadataMockProvider::new(
+            vec![ChatResponse {
+                message: ChatMessage::assistant("done"),
+                usage: None,
+            }],
+            "provider-default",
+            Some("provider-model"),
+        ));
+
+        let events = Arc::new(Mutex::new(Vec::<RunnerEvent>::new()));
+        let events_clone = events.clone();
+
+        run(
+            provider.clone(),
+            vec![ChatMessage::user("hi")],
+            vec![],
+            |_| async { Ok(ToolOutput::from("")) },
+            RunnerConfig {
+                provider_name: Some("host-provider".into()),
+                model_name: Some("host-deployment".into()),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+            Steering::new(),
+            Guardrails::default(),
+            move |event| {
+                events_clone.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "host-deployment");
+
+        let events = events.lock().unwrap();
+        let model_call = events
+            .iter()
+            .find(|event| matches!(event, RunnerEvent::ModelCall { .. }))
+            .expect("expected model call event");
+        if let RunnerEvent::ModelCall {
+            provider, model, ..
+        } = model_call
+        {
+            assert_eq!(provider, "host-provider");
+            assert_eq!(model, "host-deployment");
         }
     }
 

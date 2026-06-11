@@ -14,9 +14,10 @@ use crate::auth::AuthStrategy;
 use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
+#[cfg(test)]
+use crate::providers::request_compaction::DEFAULT_AZURE_MAX_REQUEST_BYTES;
 use crate::providers::request_compaction::{
     compact_items_to_request_limit, default_azure_max_request_bytes,
-    DEFAULT_AZURE_MAX_REQUEST_BYTES,
 };
 use crate::providers::sse::SseParser;
 use crate::types::*;
@@ -397,6 +398,10 @@ impl Provider for OpenAiProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
     }
 
     fn context_budget_chars(&self) -> usize {
