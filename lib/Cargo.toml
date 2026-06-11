@@ -26,5 +26,11 @@ sha2 = "0.10"
 base64 = "0.22"
 urlencoding = "2"
 
+tracing = { version = "0.1", optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

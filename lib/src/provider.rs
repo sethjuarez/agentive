@@ -26,6 +26,14 @@ pub trait Provider: Send + Sync {
     /// Human-readable provider name (e.g. "openai", "anthropic").
     fn name(&self) -> &str;
 
+    /// Stable model or deployment identifier used for telemetry and request metadata.
+    ///
+    /// Custom providers can override this so hosts that construct providers directly
+    /// still get populated model-call spans and `ChatRequest::model` values.
+    fn model(&self) -> Option<&str> {
+        None
+    }
+
     /// Approximate character budget for the model's context window.
     /// Used by the runner for context trimming. Default is 200k chars
     /// (~50k tokens for most models).
