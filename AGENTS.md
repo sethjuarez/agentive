@@ -815,6 +815,31 @@ cargo test           # run all 195 tests (unit + doc + integration stubs)
 cargo doc --no-deps  # generate documentation
 ```
 
+## Release and publishing
+
+Publishing to crates.io must be deliberate. Do **not** publish automatically on
+every merge to `main`.
+
+Release flow:
+
+1. Merge the fix or feature PR to `main`.
+2. Decide the next semver version. Use a patch version for bug fixes.
+3. Update `lib/Cargo.toml` and `lib/Cargo.lock` to that version.
+4. Run:
+   ```bash
+   cd lib
+   cargo test
+   cargo publish --dry-run
+   ```
+5. Commit the version bump on `main` with `chore(release): prepare agentive X.Y.Z`.
+6. Create a GitHub release/tag `vX.Y.Z` pointing at the version-bump commit.
+7. Publish to crates.io only after the user explicitly confirms. Use the
+   manual GitHub Actions workflow **Publish crate** and type `publish` in the
+   `confirm_publish` input, or run `cargo publish` locally with
+   `CARGO_REGISTRY_TOKEN` configured.
+
+If the crate version already exists on crates.io, the workflow skips publishing.
+
 ### Integration tests (real providers)
 
 Integration tests live in `lib/tests/integration.rs` and are **skipped by default**.
