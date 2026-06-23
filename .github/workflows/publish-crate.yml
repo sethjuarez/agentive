@@ -56,7 +56,8 @@ jobs:
           CRATE_NAME: ${{ steps.metadata.outputs.name }}
           CRATE_VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          status=$(curl -sS -o /tmp/crate.json -w "%{http_code}" \
+          status=$(curl -sS -H "User-Agent: sethjuarez/agentive publish workflow (https://github.com/sethjuarez/agentive)" \
+            -o /tmp/crate.json -w "%{http_code}" \
             "https://crates.io/api/v1/crates/${CRATE_NAME}/${CRATE_VERSION}")
 
           if [ "$status" = "200" ]; then
