@@ -11,7 +11,7 @@ use crate::cancel::CancellationToken;
 use crate::error::AgentError;
 use crate::provider::Provider;
 use crate::providers::request_compaction::compact_items_to_request_limit;
-use crate::providers::sse::SseParser;
+use crate::providers::sse::{SseEvent, SseEventParser};
 use crate::types::*;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -264,6 +264,7 @@ impl Provider for AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
+            .header("accept-encoding", "identity")
             .json(&body)
             .send()
             .await?;
@@ -278,166 +279,34 @@ impl Provider for AnthropicProvider {
         }
 
         let mut stream = response.bytes_stream();
-        let mut parser = SseParser::new();
+        let mut parser = SseEventParser::new();
 
         // Accumulate state across events
-        let mut full_content = String::new();
-        let mut pending_tool_uses: Vec<PendingToolUse> = Vec::new();
-        let mut input_usage: Option<u32> = None;
-        let mut output_usage: Option<u32> = None;
+        let mut state = AnthropicStreamState::default();
 
         while let Some(chunk) = stream.next().await {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
 
-            let chunk = chunk.map_err(|e| AgentError::Stream(e.to_string()))?;
-            let data_lines = parser.feed(&chunk);
+            let chunk = chunk.map_err(|e| anthropic_stream_chunk_error(&e, &state))?;
+            state.bytes_seen += chunk.len();
+            let events = parser.feed(&chunk);
 
-            for data in data_lines {
-                let parsed: serde_json::Value = match serde_json::from_str(&data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                match event_type {
-                    "message_start" => {
-                        if let Some(usage_obj) = parsed.get("message").and_then(|m| m.get("usage"))
-                        {
-                            input_usage = usage_obj
-                                .get("input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                        }
-                    }
-                    "content_block_start" => {
-                        if let Some(block) = parsed.get("content_block") {
-                            let block_type =
-                                block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
-
-                            if block_type == "tool_use" {
-                                let id = block
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name = block
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-
-                                pending_tool_uses.push(PendingToolUse {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    arguments_json: String::new(),
-                                });
-
-                                let _ = tx
-                                    .send(ChatEvent::ToolCallStart {
-                                        tool_call: ToolCall {
-                                            id,
-                                            call_type: "function".into(),
-                                            function: FunctionCall {
-                                                name,
-                                                arguments: String::new(),
-                                            },
-                                        },
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    "content_block_delta" => {
-                        if let Some(delta) = parsed.get("delta") {
-                            let delta_type =
-                                delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-                            match delta_type {
-                                "text_delta" => {
-                                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                        full_content.push_str(text);
-                                        let _ = tx
-                                            .send(ChatEvent::Token {
-                                                token: text.to_string(),
-                                            })
-                                            .await;
-                                    }
-                                }
-                                "thinking_delta" => {
-                                    if let Some(text) =
-                                        delta.get("thinking").and_then(|t| t.as_str())
-                                    {
-                                        let _ = tx
-                                            .send(ChatEvent::Thinking {
-                                                token: text.to_string(),
-                                            })
-                                            .await;
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(json_str) =
-                                        delta.get("partial_json").and_then(|j| j.as_str())
-                                    {
-                                        if let Some(last) = pending_tool_uses.last_mut() {
-                                            last.arguments_json.push_str(json_str);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "content_block_stop" => {}
-                    "message_delta" => {
-                        if let Some(usage_obj) = parsed.get("usage") {
-                            output_usage = usage_obj
-                                .get("output_tokens")
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                        }
-                    }
-                    "message_stop" => {
-                        let usage = match (input_usage, output_usage) {
-                            (Some(input), Some(output)) => Some(Usage {
-                                prompt_tokens: input,
-                                completion_tokens: output,
-                                total_tokens: input + output,
-                            }),
-                            _ => None,
-                        };
-
-                        let message = if pending_tool_uses.is_empty() {
-                            ChatMessage::assistant(&full_content)
-                        } else {
-                            let tool_calls: Vec<ToolCall> = pending_tool_uses
-                                .drain(..)
-                                .map(|tu| tu.into_tool_call())
-                                .collect();
-                            let mut msg = ChatMessage::assistant_with_tool_calls(tool_calls);
-                            if !full_content.is_empty() {
-                                msg.content = Some(MessageContent::Text(full_content.clone()));
-                            }
-                            msg
-                        };
-
-                        let _ = tx
-                            .send(ChatEvent::Done {
-                                response: ChatResponse { message, usage },
-                            })
-                            .await;
-                        return Ok(());
-                    }
-                    _ => {}
+            for event in events {
+                if process_anthropic_stream_event(event, &mut state, &tx).await? {
+                    return Ok(());
                 }
             }
         }
 
-        Err(AgentError::Stream(
-            "Stream ended without message_stop".into(),
-        ))
+        for event in parser.finish() {
+            if process_anthropic_stream_event(event, &mut state, &tx).await? {
+                return Ok(());
+            }
+        }
+
+        Err(incomplete_anthropic_stream_error(&state))
     }
 
     fn name(&self) -> &str {
@@ -499,6 +368,240 @@ struct PendingToolUse {
     id: String,
     name: String,
     arguments_json: String,
+}
+
+#[derive(Default)]
+struct AnthropicStreamState {
+    full_content: String,
+    pending_tool_uses: Vec<PendingToolUse>,
+    input_usage: Option<u32>,
+    output_usage: Option<u32>,
+    bytes_seen: usize,
+    events_seen: usize,
+    saw_message_start: bool,
+    last_event_type: Option<String>,
+}
+
+async fn process_anthropic_stream_event(
+    event: SseEvent,
+    state: &mut AnthropicStreamState,
+    tx: &mpsc::Sender<ChatEvent>,
+) -> Result<bool, AgentError> {
+    let parsed = parse_anthropic_sse_data(&event)?;
+    state.events_seen += 1;
+
+    let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    state.last_event_type = Some(event_type.to_string());
+
+    match event_type {
+        "message_start" => {
+            state.saw_message_start = true;
+            if let Some(usage_obj) = parsed.get("message").and_then(|m| m.get("usage")) {
+                state.input_usage = usage_obj
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+            }
+        }
+        "content_block_start" => {
+            if let Some(block) = parsed.get("content_block") {
+                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+
+                if block_type == "tool_use" {
+                    let id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    state.pending_tool_uses.push(PendingToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments_json: String::new(),
+                    });
+
+                    let _ = tx
+                        .send(ChatEvent::ToolCallStart {
+                            tool_call: ToolCall {
+                                id,
+                                call_type: "function".into(),
+                                function: FunctionCall {
+                                    name,
+                                    arguments: String::new(),
+                                },
+                            },
+                        })
+                        .await;
+                }
+            }
+        }
+        "content_block_delta" => {
+            if let Some(delta) = parsed.get("delta") {
+                let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                match delta_type {
+                    "text_delta" => {
+                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                            state.full_content.push_str(text);
+                            let _ = tx
+                                .send(ChatEvent::Token {
+                                    token: text.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    "thinking_delta" => {
+                        if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                            let _ = tx
+                                .send(ChatEvent::Thinking {
+                                    token: text.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(json_str) = delta.get("partial_json").and_then(|j| j.as_str()) {
+                            if let Some(last) = state.pending_tool_uses.last_mut() {
+                                last.arguments_json.push_str(json_str);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "content_block_stop" => {}
+        "message_delta" => {
+            if let Some(usage_obj) = parsed.get("usage") {
+                state.output_usage = usage_obj
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+            }
+        }
+        "message_stop" => {
+            let usage = match (state.input_usage, state.output_usage) {
+                (Some(input), Some(output)) => Some(Usage {
+                    prompt_tokens: input,
+                    completion_tokens: output,
+                    total_tokens: input + output,
+                }),
+                _ => None,
+            };
+
+            let message = if state.pending_tool_uses.is_empty() {
+                ChatMessage::assistant(&state.full_content)
+            } else {
+                let tool_calls: Vec<ToolCall> = state
+                    .pending_tool_uses
+                    .drain(..)
+                    .map(|tu| tu.into_tool_call())
+                    .collect();
+                let mut msg = ChatMessage::assistant_with_tool_calls(tool_calls);
+                if !state.full_content.is_empty() {
+                    msg.content = Some(MessageContent::Text(state.full_content.clone()));
+                }
+                msg
+            };
+
+            let _ = tx
+                .send(ChatEvent::Done {
+                    response: ChatResponse { message, usage },
+                })
+                .await;
+            return Ok(true);
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+fn parse_anthropic_sse_data(event: &SseEvent) -> Result<serde_json::Value, AgentError> {
+    let parsed: serde_json::Value = serde_json::from_str(&event.data).map_err(|e| {
+        let context = if event.event.as_deref() == Some("error") {
+            "Anthropic SSE error event contained malformed JSON"
+        } else {
+            "Anthropic SSE event contained malformed JSON"
+        };
+        AgentError::Stream(format!(
+            "{context}: {e}; event={}; payload_prefix={}",
+            event.event.as_deref().unwrap_or("message"),
+            payload_prefix(&event.data)
+        ))
+    })?;
+
+    if event.event.as_deref() == Some("error")
+        || parsed.get("type").and_then(|t| t.as_str()) == Some("error")
+    {
+        return Err(anthropic_sse_error(&parsed));
+    }
+
+    Ok(parsed)
+}
+
+fn anthropic_sse_error(parsed: &serde_json::Value) -> AgentError {
+    let error_obj = parsed.get("error").unwrap_or(parsed);
+    let error_type = error_obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_error");
+    let message = error_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Anthropic stream returned an SSE error event");
+
+    AgentError::Api {
+        status: anthropic_status_for_error_type(error_type),
+        message: format!("Anthropic SSE error ({error_type}): {message}"),
+    }
+}
+
+fn anthropic_status_for_error_type(error_type: &str) -> u16 {
+    match error_type {
+        "invalid_request_error" => 400,
+        "authentication_error" => 401,
+        "permission_error" => 403,
+        "not_found_error" => 404,
+        "rate_limit_error" => 429,
+        "overloaded_error" => 529,
+        "api_error" => 500,
+        _ => 500,
+    }
+}
+
+fn anthropic_stream_chunk_error(
+    error: &reqwest::Error,
+    state: &AnthropicStreamState,
+) -> AgentError {
+    AgentError::Stream(format!(
+        "Anthropic stream transport/decode error after {} bytes and {} events (last_event={}): {}. The request asks Anthropic for identity-encoded SSE; this can still happen if the upstream connection closes mid-chunk or sends an invalid body.",
+        state.bytes_seen,
+        state.events_seen,
+        state.last_event_type.as_deref().unwrap_or("none"),
+        error
+    ))
+}
+
+fn incomplete_anthropic_stream_error(state: &AnthropicStreamState) -> AgentError {
+    AgentError::Stream(format!(
+        "Anthropic stream ended before message_stop after {} bytes and {} events (saw_message_start={}, last_event={}, accumulated_text_chars={}, pending_tool_uses={})",
+        state.bytes_seen,
+        state.events_seen,
+        state.saw_message_start,
+        state.last_event_type.as_deref().unwrap_or("none"),
+        state.full_content.chars().count(),
+        state.pending_tool_uses.len()
+    ))
+}
+
+fn payload_prefix(payload: &str) -> String {
+    payload.chars().take(200).collect()
 }
 
 impl PendingToolUse {
@@ -743,5 +846,70 @@ mod tests {
         assert!(serialized.len() <= 500);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"], "recent question");
+    }
+
+    #[test]
+    fn test_parse_anthropic_sse_error_event_returns_api_error() {
+        let err = parse_anthropic_sse_data(&SseEvent {
+            event: Some("error".into()),
+            data: serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Overloaded"
+                }
+            })
+            .to_string(),
+        })
+        .unwrap_err();
+
+        match err {
+            AgentError::Api { status, message } => {
+                assert_eq!(status, 529);
+                assert!(message.contains("Anthropic SSE error (overloaded_error): Overloaded"));
+            }
+            other => panic!("expected API error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_anthropic_malformed_sse_data_returns_stream_error() {
+        let err = parse_anthropic_sse_data(&SseEvent {
+            event: Some("content_block_delta".into()),
+            data: "{not-json".into(),
+        })
+        .unwrap_err();
+
+        match err {
+            AgentError::Stream(message) => {
+                assert!(message.contains("Anthropic SSE event contained malformed JSON"));
+                assert!(message.contains("event=content_block_delta"));
+                assert!(message.contains("payload_prefix={not-json"));
+            }
+            other => panic!("expected stream error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_incomplete_anthropic_stream_error_has_terminal_context() {
+        let state = AnthropicStreamState {
+            full_content: "partial response".into(),
+            bytes_seen: 1234,
+            events_seen: 7,
+            saw_message_start: true,
+            last_event_type: Some("content_block_delta".into()),
+            ..Default::default()
+        };
+
+        let err = incomplete_anthropic_stream_error(&state);
+        match err {
+            AgentError::Stream(message) => {
+                assert!(message.contains("Anthropic stream ended before message_stop"));
+                assert!(message.contains("1234 bytes"));
+                assert!(message.contains("last_event=content_block_delta"));
+                assert!(message.contains("accumulated_text_chars=16"));
+            }
+            other => panic!("expected stream error, got {other:?}"),
+        }
     }
 }
