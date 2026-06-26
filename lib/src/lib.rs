@@ -61,6 +61,10 @@ pub use cancel::CancellationToken;
 pub use chat::simple_chat;
 pub use checkpoint::Checkpoint;
 pub use context_index::{ContextItem, ContextSource, ReferenceRecord, SearchIndexEntry};
+pub use discovery::{
+    recommended_anthropic_default_model, recommended_anthropic_model, recommended_openai_model,
+    validate_or_recommend_model, AnthropicModelTier, ModelInfo, ModelSelection,
+};
 pub use error::AgentError;
 pub use factory::{
     build_provider, build_provider_with_auth, context_budget, default_context_budget,

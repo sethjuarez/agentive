@@ -131,8 +131,7 @@ async fn test_openai_tool_calling() {
 #[tokio::test]
 async fn test_anthropic_simple_chat() {
     let api_key = require_env!("ANTHROPIC_API_KEY");
-    let model =
-        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+    let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
 
     let provider = Arc::new(AnthropicProvider::new(&api_key, &model));
 
@@ -167,8 +166,7 @@ async fn test_anthropic_simple_chat() {
 #[tokio::test]
 async fn test_anthropic_tool_calling() {
     let api_key = require_env!("ANTHROPIC_API_KEY");
-    let model =
-        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+    let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
 
     let provider = Arc::new(AnthropicProvider::new(&api_key, &model));
 

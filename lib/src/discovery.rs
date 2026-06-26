@@ -22,10 +22,12 @@
 //! ```
 
 use crate::auth::AuthStrategy;
+use crate::factory::{default_context_budget, needs_responses_api, supports_vision};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_ANTHROPIC_MODEL_PAGES: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -45,6 +47,31 @@ pub struct ModelInfo {
     /// Max context window in tokens, if reported.
     #[serde(default)]
     pub context_length: Option<usize>,
+}
+
+/// Preferred Anthropic family to select from discovered models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnthropicModelTier {
+    /// Prefer Claude Sonnet models.
+    Sonnet,
+    /// Prefer Claude Opus models.
+    Opus,
+    /// Prefer Claude Haiku models.
+    Haiku,
+    /// Pick the first available Anthropic model.
+    Any,
+}
+
+/// Result of validating a persisted model ID against a live discovery result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelection {
+    /// Model ID from caller settings.
+    pub requested: String,
+    /// Model ID to use now.
+    #[serde(default)]
+    pub selected: Option<String>,
+    /// True when `requested` was present in the live model list.
+    pub available: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,11 +97,35 @@ struct OpenAiModel {
 struct AnthropicModelsResponse {
     #[serde(default)]
     data: Vec<AnthropicModel>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    last_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicModel {
     id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    max_input_tokens: Option<usize>,
+    #[serde(default)]
+    capabilities: Option<AnthropicCapabilities>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicCapabilities {
+    #[serde(default)]
+    image_input: Option<AnthropicCapabilitySupport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicCapabilitySupport {
+    #[serde(default)]
+    supported: bool,
 }
 
 /// Azure OpenAI deployments: `{ "data": [{ "id": "my-gpt4", "model": "gpt-4" }] }`
@@ -170,6 +221,17 @@ fn foundry_base(endpoint: &str) -> &str {
     }
 }
 
+fn versionless_base(endpoint: &str) -> &str {
+    let base = endpoint.trim_end_matches('/');
+    if let Some(stripped) = base.strip_suffix("/v1/models") {
+        stripped
+    } else if let Some(stripped) = base.strip_suffix("/v1") {
+        stripped
+    } else {
+        base
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -189,6 +251,76 @@ pub async fn list_models(endpoint: &str, auth: &AuthStrategy) -> Result<Vec<Mode
         list_models_azure(endpoint, auth).await
     } else {
         list_models_openai(endpoint, auth).await
+    }
+}
+
+/// Return Agentive's recommended OpenAI default from a live model list.
+///
+/// OpenAI's `/v1/models` response does not include a provider default flag, so
+/// this is intentionally an Agentive-owned policy layered over live availability.
+pub fn recommended_openai_model(models: &[ModelInfo]) -> Option<String> {
+    recommended_by_preference(
+        models,
+        &["gpt-5.1", "gpt-5", "gpt-4.1", "gpt-4o", "gpt-4-turbo"],
+    )
+    .or_else(|| {
+        models
+            .iter()
+            .find(|m| {
+                capability_is_true(m, "chat_completion")
+                    && !m.id.to_lowercase().contains("codex")
+                    && !m.id.to_lowercase().ends_with("-pro")
+            })
+            .map(|m| m.id.clone())
+    })
+}
+
+/// Return Agentive's recommended Anthropic default, preferring Sonnet.
+pub fn recommended_anthropic_default_model(models: &[ModelInfo]) -> Option<String> {
+    recommended_anthropic_model(models, AnthropicModelTier::Sonnet)
+        .or_else(|| recommended_anthropic_model(models, AnthropicModelTier::Any))
+}
+
+/// Return Agentive's recommended Anthropic model for a family/tier.
+///
+/// Anthropic's Models API returns newer models first and does not expose a
+/// default flag, so this preserves response ordering within the requested tier.
+pub fn recommended_anthropic_model(
+    models: &[ModelInfo],
+    tier: AnthropicModelTier,
+) -> Option<String> {
+    models
+        .iter()
+        .find(|m| {
+            let id = m.id.to_lowercase();
+            match tier {
+                AnthropicModelTier::Sonnet => id.contains("sonnet"),
+                AnthropicModelTier::Opus => id.contains("opus"),
+                AnthropicModelTier::Haiku => id.contains("haiku"),
+                AnthropicModelTier::Any => true,
+            }
+        })
+        .map(|m| m.id.clone())
+}
+
+/// Validate a saved model ID and select a replacement when it is stale.
+pub fn validate_or_recommend_model(
+    saved_model: &str,
+    models: &[ModelInfo],
+    recommended: Option<String>,
+) -> ModelSelection {
+    if models.iter().any(|m| m.id == saved_model) {
+        return ModelSelection {
+            requested: saved_model.to_string(),
+            selected: Some(saved_model.to_string()),
+            available: true,
+        };
+    }
+
+    ModelSelection {
+        requested: saved_model.to_string(),
+        selected: recommended.or_else(|| models.first().map(|m| m.id.clone())),
+        available: false,
     }
 }
 
@@ -220,11 +352,27 @@ async fn list_models_anthropic(
     let base = if endpoint.is_empty() {
         "https://api.anthropic.com"
     } else {
-        endpoint
+        versionless_base(endpoint)
     };
-    let url = anthropic_models_url(base);
-    let body = fetch_body_anthropic(&url, auth).await?;
-    parse_anthropic_models(&body)
+    let mut after_id = None;
+    let mut models = Vec::new();
+
+    for _ in 0..MAX_ANTHROPIC_MODEL_PAGES {
+        let url = anthropic_models_page_url(base, after_id.as_deref());
+        let body = fetch_body_anthropic(&url, auth).await?;
+        let (mut page, next_after_id) = parse_anthropic_models(&body)?;
+        models.append(&mut page);
+
+        if let Some(next) = next_after_id {
+            after_id = Some(next);
+        } else {
+            return Ok(models);
+        }
+    }
+
+    Err(format!(
+        "Anthropic model list exceeded pagination limit of {MAX_ANTHROPIC_MODEL_PAGES} pages"
+    ))
 }
 
 /// Foundry: try project deployments first, then catalog.
@@ -328,15 +476,18 @@ async fn fetch_body_anthropic(url: &str, auth: &AuthStrategy) -> Result<String, 
         .map_err(|e| format!("Failed to read Anthropic models response: {e}"))
 }
 
+#[cfg(test)]
 fn anthropic_models_url(endpoint: &str) -> String {
-    let base = endpoint.trim_end_matches('/');
-    if base.ends_with("/v1/models") {
-        base.to_string()
-    } else if base.ends_with("/v1") {
-        format!("{base}/models")
-    } else {
-        format!("{base}/v1/models")
+    anthropic_models_page_url(versionless_base(endpoint), None)
+}
+
+fn anthropic_models_page_url(base: &str, after_id: Option<&str>) -> String {
+    let mut url = format!("{}/v1/models?limit=1000", base.trim_end_matches('/'));
+    if let Some(after) = after_id {
+        url.push_str("&after_id=");
+        url.push_str(&urlencoding::encode(after));
     }
+    url
 }
 
 fn parse_openai_models(body: &str) -> Result<Vec<ModelInfo>, String> {
@@ -345,28 +496,27 @@ fn parse_openai_models(body: &str) -> Result<Vec<ModelInfo>, String> {
     Ok(parsed
         .data
         .into_iter()
-        .map(|m| ModelInfo {
-            id: m.id,
-            owned_by: m.owned_by,
-            capabilities: None,
-            context_length: None,
-        })
+        .map(|m| enrich_openai_model(m.id, m.owned_by))
         .collect())
 }
 
-fn parse_anthropic_models(body: &str) -> Result<Vec<ModelInfo>, String> {
+fn parse_anthropic_models(body: &str) -> Result<(Vec<ModelInfo>, Option<String>), String> {
     let parsed: AnthropicModelsResponse =
         serde_json::from_str(body).map_err(|e| format!("Failed to parse Anthropic models: {e}"))?;
-    Ok(parsed
-        .data
-        .into_iter()
-        .map(|m| ModelInfo {
-            id: m.id,
-            owned_by: Some("anthropic".into()),
-            capabilities: None,
-            context_length: None,
-        })
-        .collect())
+    let next_after_id = if parsed.has_more {
+        parsed.last_id.clone()
+    } else {
+        None
+    };
+
+    Ok((
+        parsed
+            .data
+            .into_iter()
+            .map(enrich_anthropic_model)
+            .collect(),
+        next_after_id,
+    ))
 }
 
 fn parse_azure_deployments(body: &str) -> Result<Vec<ModelInfo>, String> {
@@ -429,6 +579,112 @@ fn parse_foundry_project_deployments(body: &str) -> Result<Vec<ModelInfo>, Strin
         .collect())
 }
 
+fn enrich_openai_model(id: String, owned_by: Option<String>) -> ModelInfo {
+    let context_length = estimated_context_tokens(&id);
+    ModelInfo {
+        capabilities: Some(openai_capabilities(&id, context_length)),
+        context_length: Some(context_length),
+        id,
+        owned_by,
+    }
+}
+
+fn enrich_anthropic_model(model: AnthropicModel) -> ModelInfo {
+    let mut capabilities = HashMap::new();
+    capabilities.insert("chat_completion".to_string(), "true".to_string());
+    capabilities.insert("tool_calling".to_string(), "true".to_string());
+    capabilities.insert("streaming".to_string(), "true".to_string());
+    capabilities.insert("structured_outputs".to_string(), "false".to_string());
+    capabilities.insert("reasoning_effort".to_string(), "false".to_string());
+
+    if let Some(display_name) = model.display_name {
+        capabilities.insert("display_name".to_string(), display_name);
+    }
+    if let Some(created_at) = model.created_at {
+        capabilities.insert("created_at".to_string(), created_at);
+    }
+
+    let vision = model
+        .capabilities
+        .and_then(|c| c.image_input)
+        .map(|image| image.supported)
+        .unwrap_or_else(|| supports_vision(&model.id) || is_modern_claude_vision_model(&model.id));
+    capabilities.insert("vision".to_string(), vision.to_string());
+
+    ModelInfo {
+        id: model.id,
+        owned_by: Some("anthropic".to_string()),
+        capabilities: Some(capabilities),
+        context_length: model.max_input_tokens,
+    }
+}
+
+fn openai_capabilities(model: &str, context_length: usize) -> HashMap<String, String> {
+    let mut capabilities = HashMap::new();
+    let chat = is_openai_chat_model(model);
+    capabilities.insert("chat_completion".to_string(), chat.to_string());
+    capabilities.insert(
+        "responses_api".to_string(),
+        needs_responses_api(model).to_string(),
+    );
+    capabilities.insert("tool_calling".to_string(), chat.to_string());
+    capabilities.insert("vision".to_string(), supports_vision(model).to_string());
+    capabilities.insert("streaming".to_string(), chat.to_string());
+    capabilities.insert("structured_outputs".to_string(), chat.to_string());
+    capabilities.insert(
+        "reasoning_effort".to_string(),
+        supports_reasoning_effort(model).to_string(),
+    );
+    capabilities.insert("context_length".to_string(), context_length.to_string());
+    capabilities.insert(
+        "context_budget_chars".to_string(),
+        default_context_budget(model).to_string(),
+    );
+    capabilities
+}
+
+fn is_openai_chat_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    !m.contains("embedding")
+        && !m.contains("whisper")
+        && !m.contains("tts")
+        && !m.contains("dall-e")
+        && !m.contains("moderation")
+}
+
+fn supports_reasoning_effort(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+}
+
+fn is_modern_claude_vision_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.starts_with("claude-")
+        && (m.contains("-sonnet-") || m.contains("-opus-") || m.contains("-haiku-"))
+}
+
+fn estimated_context_tokens(model: &str) -> usize {
+    default_context_budget(model) / 3
+}
+
+fn recommended_by_preference(models: &[ModelInfo], preferences: &[&str]) -> Option<String> {
+    preferences.iter().find_map(|preferred| {
+        models
+            .iter()
+            .find(|m| m.id == *preferred)
+            .map(|m| m.id.clone())
+    })
+}
+
+fn capability_is_true(model: &ModelInfo, name: &str) -> bool {
+    model
+        .capabilities
+        .as_ref()
+        .and_then(|c| c.get(name))
+        .map(|v| v == "true")
+        .unwrap_or_else(|| name == "chat_completion" && is_openai_chat_model(&model.id))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -481,21 +737,119 @@ mod tests {
     }
 
     #[test]
+    fn test_versionless_base() {
+        assert_eq!(
+            versionless_base("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            versionless_base("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            versionless_base("https://api.anthropic.com/v1/models"),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            versionless_base("https://api.anthropic.com"),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
     fn test_parse_openai_models() {
         let body = r#"{"data":[{"id":"gpt-4o","owned_by":"openai"},{"id":"gpt-3.5-turbo","owned_by":"openai"}]}"#;
         let models = parse_openai_models(body).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "gpt-4o");
         assert_eq!(models[1].id, "gpt-3.5-turbo");
+        assert_eq!(models[0].context_length, Some(128_000));
+        let caps = models[0].capabilities.as_ref().unwrap();
+        assert_eq!(
+            caps.get("chat_completion").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(caps.get("vision").map(String::as_str), Some("true"));
+        assert_eq!(caps.get("responses_api").map(String::as_str), Some("false"));
+        assert_eq!(
+            caps.get("context_budget_chars").map(String::as_str),
+            Some("384000")
+        );
+    }
+
+    #[test]
+    fn test_parse_openai_models_marks_non_chat_models() {
+        let body = r#"{"data":[{"id":"text-embedding-3-small","owned_by":"openai"}]}"#;
+        let models = parse_openai_models(body).unwrap();
+        let caps = models[0].capabilities.as_ref().unwrap();
+        assert_eq!(
+            caps.get("chat_completion").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(caps.get("tool_calling").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn test_openai_recommendation_policy() {
+        let body = r#"{"data":[
+            {"id":"text-embedding-3-small","owned_by":"openai"},
+            {"id":"gpt-4o","owned_by":"openai"},
+            {"id":"gpt-5","owned_by":"openai"}
+        ]}"#;
+        let models = parse_openai_models(body).unwrap();
+        assert_eq!(recommended_openai_model(&models).as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn test_openai_recommendation_falls_back_to_chat_model() {
+        let body = r#"{"data":[
+            {"id":"text-embedding-3-small","owned_by":"openai"},
+            {"id":"custom-chat-model","owned_by":"openai"}
+        ]}"#;
+        let models = parse_openai_models(body).unwrap();
+        assert_eq!(
+            recommended_openai_model(&models).as_deref(),
+            Some("custom-chat-model")
+        );
     }
 
     #[test]
     fn test_parse_anthropic_models() {
-        let body = r#"{"data":[{"id":"claude-sonnet-4-5"},{"id":"claude-haiku-4-5"}]}"#;
+        let body = r#"{
+            "data": [
+                {
+                    "id": "claude-sonnet-4-6",
+                    "display_name": "Claude Sonnet 4.6",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "max_input_tokens": 200000,
+                    "capabilities": {
+                        "image_input": { "supported": true }
+                    }
+                },
+                {
+                    "id": "claude-haiku-4-5",
+                    "max_input_tokens": 200000,
+                    "capabilities": {
+                        "image_input": { "supported": false }
+                    }
+                }
+            ],
+            "has_more": true,
+            "last_id": "claude-haiku-4-5"
+        }"#;
         let models = parse_anthropic_models(body).unwrap();
+        let (models, next) = models;
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "claude-sonnet-4-5");
+        assert_eq!(next.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(models[0].id, "claude-sonnet-4-6");
         assert_eq!(models[0].owned_by.as_deref(), Some("anthropic"));
+        assert_eq!(models[0].context_length, Some(200_000));
+        let caps = models[0].capabilities.as_ref().unwrap();
+        assert_eq!(caps.get("vision").map(String::as_str), Some("true"));
+        assert_eq!(
+            caps.get("display_name").map(String::as_str),
+            Some("Claude Sonnet 4.6")
+        );
         assert_eq!(models[1].id, "claude-haiku-4-5");
     }
 
@@ -503,15 +857,70 @@ mod tests {
     fn test_anthropic_models_url_normalizes_endpoint() {
         assert_eq!(
             anthropic_models_url("https://api.anthropic.com"),
-            "https://api.anthropic.com/v1/models"
+            "https://api.anthropic.com/v1/models?limit=1000"
         );
         assert_eq!(
             anthropic_models_url("https://api.anthropic.com/v1"),
-            "https://api.anthropic.com/v1/models"
+            "https://api.anthropic.com/v1/models?limit=1000"
         );
         assert_eq!(
             anthropic_models_url("https://api.anthropic.com/v1/models"),
-            "https://api.anthropic.com/v1/models"
+            "https://api.anthropic.com/v1/models?limit=1000"
+        );
+        assert_eq!(
+            anthropic_models_page_url("https://api.anthropic.com", Some("claude/sonnet")),
+            "https://api.anthropic.com/v1/models?limit=1000&after_id=claude%2Fsonnet"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_recommendation_policy() {
+        let body = r#"{"data":[
+            {"id":"claude-opus-4-8","max_input_tokens":200000},
+            {"id":"claude-sonnet-4-6","max_input_tokens":200000},
+            {"id":"claude-haiku-4-5","max_input_tokens":200000}
+        ]}"#;
+        let (models, _) = parse_anthropic_models(body).unwrap();
+
+        assert_eq!(
+            recommended_anthropic_default_model(&models).as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            recommended_anthropic_model(&models, AnthropicModelTier::Opus).as_deref(),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            models[1]
+                .capabilities
+                .as_ref()
+                .and_then(|c| c.get("vision"))
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_validate_or_recommend_model() {
+        let body = r#"{"data":[{"id":"gpt-5","owned_by":"openai"}]}"#;
+        let models = parse_openai_models(body).unwrap();
+
+        assert_eq!(
+            validate_or_recommend_model("gpt-5", &models, recommended_openai_model(&models)),
+            ModelSelection {
+                requested: "gpt-5".to_string(),
+                selected: Some("gpt-5".to_string()),
+                available: true,
+            }
+        );
+
+        assert_eq!(
+            validate_or_recommend_model("stale-model", &models, recommended_openai_model(&models)),
+            ModelSelection {
+                requested: "stale-model".to_string(),
+                selected: Some("gpt-5".to_string()),
+                available: false,
+            }
         );
     }
 
@@ -562,13 +971,94 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "claude-sonnet-4-5");
-        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        assert!(request.starts_with("GET /v1/models?limit=1000 HTTP/1.1"));
         assert!(request.contains("x-api-key: test-key"));
         assert!(request.contains("anthropic-version: 2023-06-01"));
         assert!(!request
             .lines()
             .any(|line| line.eq_ignore_ascii_case("api-key: test-key")));
         assert!(!request.to_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn test_list_models_anthropic_paginates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in [
+                r#"{"data":[{"id":"claude-sonnet-4-6"}],"has_more":true,"last_id":"claude-sonnet-4-6"}"#,
+                r#"{"data":[{"id":"claude-haiku-4-5"}],"has_more":false}"#,
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let models = list_models_anthropic(
+            &format!("http://{addr}/v1"),
+            &AuthStrategy::ApiKey("test-key".into()),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-4-6");
+        assert_eq!(models[1].id, "claude-haiku-4-5");
+        assert!(requests[0].starts_with("GET /v1/models?limit=1000 HTTP/1.1"));
+        assert!(requests[1]
+            .starts_with("GET /v1/models?limit=1000&after_id=claude-sonnet-4-6 HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn test_list_models_anthropic_pagination_is_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = 0;
+            for _ in 0..MAX_ANTHROPIC_MODEL_PAGES {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 4096];
+                let _ = socket.read(&mut buf).await.unwrap();
+                requests += 1;
+                let body =
+                    r#"{"data":[{"id":"claude-sonnet-4-6"}],"has_more":true,"last_id":"same"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let err = list_models_anthropic(
+            &format!("http://{addr}/v1"),
+            &AuthStrategy::ApiKey("test-key".into()),
+        )
+        .await
+        .unwrap_err();
+        let requests = server.await.unwrap();
+
+        assert_eq!(requests, MAX_ANTHROPIC_MODEL_PAGES);
+        assert!(err.contains("exceeded pagination limit"));
     }
 
     #[test]
