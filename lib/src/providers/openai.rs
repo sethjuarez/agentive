@@ -355,28 +355,10 @@ impl Provider for OpenAiProvider {
                     for tc in tc_array {
                         let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
 
-                        let entry = tool_calls.entry(index).or_insert_with(|| PendingToolCall {
-                            id: String::new(),
-                            name: String::new(),
-                            arguments: String::new(),
-                        });
-
-                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                            entry.id = id.to_string();
-                        }
-                        if let Some(func) = tc.get("function") {
-                            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                entry.name = name.to_string();
-                            }
-                            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                                entry.arguments.push_str(args);
-                            }
-                        }
+                        let entry = tool_calls.entry(index).or_default();
 
                         // Emit tool_call start when we first get the name
-                        if !entry.name.is_empty()
-                            && tc.get("function").and_then(|f| f.get("name")).is_some()
-                        {
+                        if entry.update_from_delta(tc) {
                             let _ = tx
                                 .send(ChatEvent::ToolCallStart {
                                     tool_call: entry.clone().into_tool_call(),
@@ -599,14 +581,35 @@ fn parse_content_part(value: &serde_json::Value) -> Option<ContentPart> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct PendingToolCall {
     id: String,
     name: String,
     arguments: String,
+    start_emitted: bool,
 }
 
 impl PendingToolCall {
+    fn update_from_delta(&mut self, tc: &serde_json::Value) -> bool {
+        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+            self.id = id.to_string();
+        }
+        if let Some(func) = tc.get("function") {
+            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                self.name = name.to_string();
+            }
+            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                self.arguments.push_str(args);
+            }
+        }
+
+        if !self.name.is_empty() && !self.start_emitted {
+            self.start_emitted = true;
+            return true;
+        }
+        false
+    }
+
     fn into_tool_call(self) -> ToolCall {
         ToolCall {
             id: self.id,
@@ -933,20 +936,8 @@ mod tests {
                 if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
                     for tc in tc_array {
                         let index = tc["index"].as_u64().unwrap_or(0) as u32;
-                        let entry = tool_calls.entry(index).or_insert_with(|| PendingToolCall {
-                            id: String::new(),
-                            name: String::new(),
-                            arguments: String::new(),
-                        });
-                        if let Some(id) = tc["id"].as_str() {
-                            entry.id = id.to_string();
-                        }
-                        if let Some(name) = tc["function"]["name"].as_str() {
-                            entry.name = name.to_string();
-                        }
-                        if let Some(args) = tc["function"]["arguments"].as_str() {
-                            entry.arguments.push_str(args);
-                        }
+                        let entry = tool_calls.entry(index).or_default();
+                        entry.update_from_delta(tc);
                     }
                 }
             }
@@ -968,5 +959,26 @@ mod tests {
             }
             _ => panic!("Expected Done with tool calls"),
         }
+    }
+
+    #[test]
+    fn pending_tool_call_start_emits_once() {
+        let mut pending = PendingToolCall::default();
+
+        assert!(pending.update_from_delta(&serde_json::json!({
+            "id": "call_1",
+            "function": { "name": "read_file", "arguments": "" }
+        })));
+        assert!(!pending.update_from_delta(&serde_json::json!({
+            "function": { "name": "read_file", "arguments": "{\"path\"" }
+        })));
+        assert!(!pending.update_from_delta(&serde_json::json!({
+            "function": { "arguments": ":\"test.txt\"}" }
+        })));
+
+        let call = pending.into_tool_call();
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.function.name, "read_file");
+        assert_eq!(call.function.arguments, "{\"path\":\"test.txt\"}");
     }
 }

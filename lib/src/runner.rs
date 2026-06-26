@@ -1442,18 +1442,21 @@ where
     Fut: std::future::Future<Output = Result<ToolOutput, String>> + Send,
     E: Fn(RunnerEvent) + Send + Sync,
 {
+    for tc in tool_calls {
+        emit_trajectory(
+            config,
+            TrajectoryEvent::tool_call_started(
+                tc.id.clone(),
+                tc.function.name.clone(),
+                ArgumentSummary::redacted(&tc.function.arguments),
+                trajectory_metadata(config, run_id, Some(iteration)),
+            ),
+        )?;
+    }
+
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|tc| {
-            let _ = emit_trajectory(
-                config,
-                TrajectoryEvent::tool_call_started(
-                    tc.id.clone(),
-                    tc.function.name.clone(),
-                    ArgumentSummary::redacted(&tc.function.arguments),
-                    trajectory_metadata(config, run_id, Some(iteration)),
-                ),
-            );
             let tc_clone = tc.clone();
             #[cfg(feature = "tracing")]
             let run_id = run_id.to_string();

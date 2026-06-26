@@ -142,7 +142,7 @@ pub async fn summarize_dropped_with_llm(
     provider: &std::sync::Arc<dyn crate::provider::Provider>,
     cancel: &crate::cancel::CancellationToken,
 ) -> String {
-    use crate::types::{ChatRequest, ChatEvent};
+    use crate::types::{ChatEvent, ChatRequest};
     use tokio::sync::mpsc;
 
     let fast_summary = summarize_dropped(dropped);
@@ -162,7 +162,7 @@ pub async fn summarize_dropped_with_llm(
             ChatMessage::system("You are a conversation summarizer. Be concise and factual."),
             ChatMessage::user(&prompt),
         ],
-        model: String::new(),
+        model: provider.model().unwrap_or_default().to_string(),
         tools: None,
         stream: true,
         response_format: None,
@@ -172,9 +172,7 @@ pub async fn summarize_dropped_with_llm(
     let provider_clone = provider.clone();
     let cancel_clone = cancel.clone();
 
-    let handle = tokio::spawn(async move {
-        provider_clone.chat(request, tx, &cancel_clone).await
-    });
+    let handle = tokio::spawn(async move { provider_clone.chat(request, tx, &cancel_clone).await });
 
     let mut llm_summary = String::new();
     while let Some(event) = rx.recv().await {
@@ -201,10 +199,7 @@ pub async fn summarize_dropped_with_llm(
         return fast_summary;
     }
 
-    format!(
-        "[Earlier conversation summary]\n{}",
-        llm_summary.trim()
-    )
+    format!("[Earlier conversation summary]\n{}", llm_summary.trim())
 }
 
 #[cfg(test)]
@@ -260,8 +255,16 @@ mod tests {
         let mut msgs = vec![ChatMessage::system("system prompt")];
         // Add many messages to exceed budget
         for i in 0..50 {
-            msgs.push(ChatMessage::user(&format!("message {}: {}", i, "x".repeat(500))));
-            msgs.push(ChatMessage::assistant(&format!("response {}: {}", i, "y".repeat(500))));
+            msgs.push(ChatMessage::user(&format!(
+                "message {}: {}",
+                i,
+                "x".repeat(500)
+            )));
+            msgs.push(ChatMessage::assistant(&format!(
+                "response {}: {}",
+                i,
+                "y".repeat(500)
+            )));
         }
 
         let total_before = msgs.len();
@@ -273,7 +276,10 @@ mod tests {
         assert_eq!(msgs[0].role, "system");
         // Summary should be inserted after system
         assert_eq!(msgs[1].role, "user");
-        assert!(msgs[1].text().unwrap().contains("[Earlier conversation summary]"));
+        assert!(msgs[1]
+            .text()
+            .unwrap()
+            .contains("[Earlier conversation summary]"));
     }
 
     #[test]
@@ -339,19 +345,27 @@ mod tests {
                 assert_eq!(request.messages.len(), 2); // system + user
                 assert_eq!(request.messages[0].role, "system");
                 assert!(request.messages[1].text().unwrap().contains("User asked:"));
+                assert_eq!(request.model, "summary-model");
 
-                let _ = tx.send(crate::types::ChatEvent::Done {
-                    response: crate::types::ChatResponse {
-                        message: ChatMessage::assistant(
-                            "User asked about Rust safety. Assistant explained ownership."
-                        ),
-                        usage: None,
-                    },
-                }).await;
+                let _ = tx
+                    .send(crate::types::ChatEvent::Done {
+                        response: crate::types::ChatResponse {
+                            message: ChatMessage::assistant(
+                                "User asked about Rust safety. Assistant explained ownership.",
+                            ),
+                            usage: None,
+                        },
+                    })
+                    .await;
                 Ok(())
             }
 
-            fn name(&self) -> &str { "summary_mock" }
+            fn name(&self) -> &str {
+                "summary_mock"
+            }
+            fn model(&self) -> Option<&str> {
+                Some("summary-model")
+            }
         }
 
         let dropped = vec![
@@ -359,7 +373,8 @@ mod tests {
             ChatMessage::assistant("Rust uses ownership and borrowing to ensure memory safety."),
         ];
 
-        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(SummaryProvider);
+        let provider: std::sync::Arc<dyn crate::provider::Provider> =
+            std::sync::Arc::new(SummaryProvider);
         let cancel = CancellationToken::new();
 
         let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
@@ -383,10 +398,15 @@ mod tests {
                 _tx: tokio::sync::mpsc::Sender<crate::types::ChatEvent>,
                 _cancel: &CancellationToken,
             ) -> Result<(), AgentError> {
-                Err(AgentError::Api { status: 500, message: "Server error".into() })
+                Err(AgentError::Api {
+                    status: 500,
+                    message: "Server error".into(),
+                })
             }
 
-            fn name(&self) -> &str { "error_mock" }
+            fn name(&self) -> &str {
+                "error_mock"
+            }
         }
 
         let dropped = vec![
@@ -394,7 +414,8 @@ mod tests {
             ChatMessage::assistant("A systems programming language."),
         ];
 
-        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(ErrorProvider);
+        let provider: std::sync::Arc<dyn crate::provider::Provider> =
+            std::sync::Arc::new(ErrorProvider);
         let cancel = CancellationToken::new();
 
         let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
@@ -421,23 +442,26 @@ mod tests {
                 _cancel: &CancellationToken,
             ) -> Result<(), AgentError> {
                 // Return an empty response
-                let _ = tx.send(crate::types::ChatEvent::Done {
-                    response: crate::types::ChatResponse {
-                        message: ChatMessage::assistant(""),
-                        usage: None,
-                    },
-                }).await;
+                let _ = tx
+                    .send(crate::types::ChatEvent::Done {
+                        response: crate::types::ChatResponse {
+                            message: ChatMessage::assistant(""),
+                            usage: None,
+                        },
+                    })
+                    .await;
                 Ok(())
             }
 
-            fn name(&self) -> &str { "empty_mock" }
+            fn name(&self) -> &str {
+                "empty_mock"
+            }
         }
 
-        let dropped = vec![
-            ChatMessage::user("Hello"),
-        ];
+        let dropped = vec![ChatMessage::user("Hello")];
 
-        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(EmptyProvider);
+        let provider: std::sync::Arc<dyn crate::provider::Provider> =
+            std::sync::Arc::new(EmptyProvider);
         let cancel = CancellationToken::new();
 
         let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;
@@ -471,14 +495,15 @@ mod tests {
                 Ok(())
             }
 
-            fn name(&self) -> &str { "slow_mock" }
+            fn name(&self) -> &str {
+                "slow_mock"
+            }
         }
 
-        let dropped = vec![
-            ChatMessage::user("Something"),
-        ];
+        let dropped = vec![ChatMessage::user("Something")];
 
-        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(SlowProvider);
+        let provider: std::sync::Arc<dyn crate::provider::Provider> =
+            std::sync::Arc::new(SlowProvider);
         let cancel = CancellationToken::new();
         cancel.cancel(); // Pre-cancel
 
@@ -505,12 +530,15 @@ mod tests {
                 panic!("Should not be called for empty dropped messages");
             }
 
-            fn name(&self) -> &str { "never_called" }
+            fn name(&self) -> &str {
+                "never_called"
+            }
         }
 
         let dropped: Vec<ChatMessage> = vec![];
 
-        let provider: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(NeverCalledProvider);
+        let provider: std::sync::Arc<dyn crate::provider::Provider> =
+            std::sync::Arc::new(NeverCalledProvider);
         let cancel = CancellationToken::new();
 
         let result = super::summarize_dropped_with_llm(&dropped, &provider, &cancel).await;

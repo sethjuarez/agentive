@@ -52,7 +52,7 @@ pub async fn simple_chat(
     let cancel = CancellationToken::new();
     let request = ChatRequest {
         messages,
-        model: String::new(),
+        model: provider.model().unwrap_or_default().to_string(),
         tools: None,
         stream: false,
         response_format: None,
@@ -95,6 +95,7 @@ mod tests {
                 tx: mpsc::Sender<ChatEvent>,
                 _cancel: &CancellationToken,
             ) -> Result<(), AgentError> {
+                assert_eq!(request.model, "echo-model");
                 let user_text = request
                     .messages
                     .last()
@@ -120,18 +121,19 @@ mod tests {
                 "echo"
             }
 
+            fn model(&self) -> Option<&str> {
+                Some("echo-model")
+            }
+
             fn context_budget_chars(&self) -> usize {
                 100_000
             }
         }
 
         let provider: Arc<dyn Provider> = Arc::new(EchoProvider);
-        let result = simple_chat(
-            provider,
-            vec![ChatMessage::user("hello")],
-        )
-        .await
-        .unwrap();
+        let result = simple_chat(provider, vec![ChatMessage::user("hello")])
+            .await
+            .unwrap();
 
         assert_eq!(result.text(), Some("Echo: hello"));
         assert_eq!(result.role, "assistant");

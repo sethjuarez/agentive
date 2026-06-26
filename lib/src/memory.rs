@@ -80,20 +80,14 @@ impl MemoryStore {
     ///
     /// For `Core` memories, entries with matching tags are replaced (dedup).
     /// When the store exceeds [`MAX_MEMORIES`], the oldest archival entries
-    /// are evicted first.
-    pub fn save(
-        &mut self,
-        category: MemoryCategory,
-        content: &str,
-        tags: Vec<String>,
-    ) {
+    /// are evicted first, then the oldest non-archival entries if needed.
+    pub fn save(&mut self, category: MemoryCategory, content: &str, tags: Vec<String>) {
         let now = chrono::Utc::now().to_rfc3339();
 
         // Core memories: replace existing entry with same tags (dedup)
         if category == MemoryCategory::Core && !tags.is_empty() {
-            self.memories.retain(|m| {
-                !(m.category == MemoryCategory::Core && m.tags == tags)
-            });
+            self.memories
+                .retain(|m| !(m.category == MemoryCategory::Core && m.tags == tags));
         }
 
         self.memories.push(MemoryEntry {
@@ -103,13 +97,14 @@ impl MemoryStore {
             tags,
         });
 
-        // Evict oldest archival entries when over capacity
+        // Prefer dropping archival memories, but always enforce the hard cap.
         while self.memories.len() > MAX_MEMORIES {
-            let archival_idx = self.memories.iter().position(|m| m.category == MemoryCategory::Archival);
-            match archival_idx {
-                Some(idx) => { self.memories.remove(idx); }
-                None => break, // No archival to evict — hard stop
-            }
+            let idx = self
+                .memories
+                .iter()
+                .position(|m| m.category == MemoryCategory::Archival)
+                .unwrap_or(0);
+            self.memories.remove(idx);
         }
     }
 
@@ -130,7 +125,8 @@ impl MemoryStore {
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
 
-        let mut scored: Vec<(usize, &MemoryEntry)> = self.memories
+        let mut scored: Vec<(usize, &MemoryEntry)> = self
+            .memories
             .iter()
             .filter_map(|m| {
                 let content_lower = m.content.to_lowercase();
@@ -138,15 +134,23 @@ impl MemoryStore {
 
                 let mut score = 0usize;
                 for kw in &keywords {
-                    if content_lower.contains(kw) { score += 2; }
-                    if tag_text.contains(kw) { score += 3; }
+                    if content_lower.contains(kw) {
+                        score += 2;
+                    }
+                    if tag_text.contains(kw) {
+                        score += 3;
+                    }
                 }
 
                 if score > 0 && m.category == MemoryCategory::Core {
                     score += 1;
                 }
 
-                if score > 0 { Some((score, m)) } else { None }
+                if score > 0 {
+                    Some((score, m))
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -156,7 +160,8 @@ impl MemoryStore {
 
     /// Get all core memories (for system prompt injection).
     pub fn core_memories(&self) -> Vec<&MemoryEntry> {
-        self.memories.iter()
+        self.memories
+            .iter()
             .filter(|m| m.category == MemoryCategory::Core)
             .collect()
     }
@@ -324,9 +329,21 @@ mod tests {
     #[test]
     fn save_and_recall() {
         let mut store = MemoryStore::default();
-        store.save(MemoryCategory::Core, "User prefers TypeScript", vec!["language".into()]);
-        store.save(MemoryCategory::Insight, "Dashboard needs chart builder", vec!["dashboard".into()]);
-        store.save(MemoryCategory::Archival, "Session discussed login flow", vec!["session:1".into()]);
+        store.save(
+            MemoryCategory::Core,
+            "User prefers TypeScript",
+            vec!["language".into()],
+        );
+        store.save(
+            MemoryCategory::Insight,
+            "Dashboard needs chart builder",
+            vec!["dashboard".into()],
+        );
+        store.save(
+            MemoryCategory::Archival,
+            "Session discussed login flow",
+            vec!["session:1".into()],
+        );
 
         let results = store.recall("dashboard chart");
         assert_eq!(results.len(), 1);
@@ -340,12 +357,23 @@ mod tests {
     #[test]
     fn core_dedup_by_tags() {
         let mut store = MemoryStore::default();
-        store.save(MemoryCategory::Core, "User likes blue", vec!["color-pref".into()]);
-        store.save(MemoryCategory::Core, "User likes purple", vec!["color-pref".into()]);
+        store.save(
+            MemoryCategory::Core,
+            "User likes blue",
+            vec!["color-pref".into()],
+        );
+        store.save(
+            MemoryCategory::Core,
+            "User likes purple",
+            vec!["color-pref".into()],
+        );
 
         let cores = store.core_memories();
         assert_eq!(cores.len(), 1, "Should dedup core memories with same tags");
-        assert!(cores[0].content.contains("purple"), "Should keep the latest value");
+        assert!(
+            cores[0].content.contains("purple"),
+            "Should keep the latest value"
+        );
     }
 
     #[test]
@@ -354,7 +382,11 @@ mod tests {
         store.save(MemoryCategory::Core, "Fact A", vec![]);
         store.save(MemoryCategory::Core, "Fact B", vec![]);
 
-        assert_eq!(store.core_memories().len(), 2, "Empty tags should not trigger dedup");
+        assert_eq!(
+            store.core_memories().len(),
+            2,
+            "Empty tags should not trigger dedup"
+        );
     }
 
     #[test]
@@ -372,14 +404,42 @@ mod tests {
         // First entry should no longer be "session 0"
         assert!(!store.memories[0].content.contains("session 0"));
         // Last entry should be the core
-        assert!(store.memories.last().unwrap().content.contains("important fact"));
+        assert!(store
+            .memories
+            .last()
+            .unwrap()
+            .content
+            .contains("important fact"));
+    }
+
+    #[test]
+    fn capacity_is_enforced_without_archival_memories() {
+        let mut store = MemoryStore::default();
+        for i in 0..200 {
+            store.save(MemoryCategory::Insight, &format!("insight {i}"), vec![]);
+        }
+        assert_eq!(store.memories.len(), 200);
+
+        store.save(MemoryCategory::Core, "new core", vec!["key".into()]);
+
+        assert_eq!(store.memories.len(), 200);
+        assert!(!store.memories[0].content.contains("insight 0"));
+        assert!(store.memories.last().unwrap().content.contains("new core"));
     }
 
     #[test]
     fn recall_scores_tags_higher() {
         let mut store = MemoryStore::default();
-        store.save(MemoryCategory::Insight, "We discussed the dashboard layout", vec![]);
-        store.save(MemoryCategory::Core, "Monitoring setup", vec!["dashboard".into()]);
+        store.save(
+            MemoryCategory::Insight,
+            "We discussed the dashboard layout",
+            vec![],
+        );
+        store.save(
+            MemoryCategory::Core,
+            "Monitoring setup",
+            vec!["dashboard".into()],
+        );
 
         let results = store.recall("dashboard");
         assert_eq!(results.len(), 2);
@@ -414,7 +474,11 @@ mod tests {
     #[test]
     fn format_recall_results_output() {
         let mut store = MemoryStore::default();
-        store.save(MemoryCategory::Core, "Tech stack: Rust + React", vec!["tech".into()]);
+        store.save(
+            MemoryCategory::Core,
+            "Tech stack: Rust + React",
+            vec!["tech".into()],
+        );
         let results = store.recall("tech");
         let formatted = MemoryStore::format_recall_results(&results);
         assert!(formatted.contains("[core]"));
@@ -434,7 +498,9 @@ mod tests {
         store.archive_session("Discussed login flow", "chat-2026-01");
         assert_eq!(store.memories.len(), 1);
         assert_eq!(store.memories[0].category, MemoryCategory::Archival);
-        assert!(store.memories[0].tags.contains(&"session:chat-2026-01".to_string()));
+        assert!(store.memories[0]
+            .tags
+            .contains(&"session:chat-2026-01".to_string()));
     }
 
     #[test]

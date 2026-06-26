@@ -539,22 +539,29 @@ fn parse_anthropic_sse_data(event: &SseEvent) -> Result<serde_json::Value, Agent
     if event.event.as_deref() == Some("error")
         || parsed.get("type").and_then(|t| t.as_str()) == Some("error")
     {
-        return Err(anthropic_sse_error(&parsed));
+        return Err(anthropic_sse_error(&parsed, &event.data));
     }
 
     Ok(parsed)
 }
 
-fn anthropic_sse_error(parsed: &serde_json::Value) -> AgentError {
-    let error_obj = parsed.get("error").unwrap_or(parsed);
+fn anthropic_sse_error(parsed: &serde_json::Value, payload: &str) -> AgentError {
+    let error_obj = parsed.get("error").and_then(|error| error.as_object());
     let error_type = error_obj
-        .get("type")
+        .and_then(|error| error.get("type"))
         .and_then(|v| v.as_str())
+        .or_else(|| parsed.get("type").and_then(|v| v.as_str()))
         .unwrap_or("unknown_error");
     let message = error_obj
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Anthropic stream returned an SSE error event");
+        .and_then(|error| error.get("message"))
+        .and_then(|v| v.as_str());
+    let message = match message {
+        Some(message) => message.to_string(),
+        None => format!(
+            "Anthropic stream returned an SSE error event with an unexpected payload shape; payload_prefix={}",
+            payload_prefix(payload)
+        ),
+    };
 
     AgentError::Api {
         status: anthropic_status_for_error_type(error_type),
@@ -867,6 +874,30 @@ mod tests {
             AgentError::Api { status, message } => {
                 assert_eq!(status, 529);
                 assert!(message.contains("Anthropic SSE error (overloaded_error): Overloaded"));
+            }
+            other => panic!("expected API error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_anthropic_sse_error_with_unexpected_shape_has_payload_context() {
+        let err = parse_anthropic_sse_data(&SseEvent {
+            event: Some("error".into()),
+            data: serde_json::json!({
+                "type": "error",
+                "detail": "upstream closed"
+            })
+            .to_string(),
+        })
+        .unwrap_err();
+
+        match err {
+            AgentError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert!(message.contains("Anthropic SSE error (error)"));
+                assert!(message.contains("unexpected payload shape"));
+                assert!(message.contains("payload_prefix="));
+                assert!(message.contains("upstream closed"));
             }
             other => panic!("expected API error, got {other:?}"),
         }
