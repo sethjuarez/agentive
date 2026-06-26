@@ -832,13 +832,18 @@ Release flow:
    cargo publish --dry-run
    ```
 5. Commit the version bump on `main` with `chore(release): prepare agentive X.Y.Z`.
-6. Create a GitHub release/tag `vX.Y.Z` pointing at the version-bump commit.
-7. Publish to crates.io only after the user explicitly confirms. Use the
-   manual GitHub Actions workflow **Publish crate** and type `publish` in the
-   `confirm_publish` input, or run `cargo publish` locally with
-   `CARGO_REGISTRY_TOKEN` configured.
+6. Publish to crates.io only after the user explicitly confirms. Use the
+   manual GitHub Actions workflow **Publish crate** from `main`, enter the
+   `version` as `X.Y.Z`, and type `publish` in the `confirm_publish` input.
+   The workflow runs tests, verifies `lib/Cargo.toml` and `lib/Cargo.lock` for
+   newly published versions, runs `cargo publish --dry-run` for newly published
+   versions, publishes only if crates.io does not already have the version, then
+   reconciles the annotated `vX.Y.Z` Git tag and GitHub release notes.
+7. Prefer the workflow over local `cargo publish`. If local publishing is
+   unavoidable, also create or reconcile the matching GitHub tag/release.
 
-If the crate version already exists on crates.io, the workflow skips publishing.
+If the crate version already exists on crates.io, the workflow skips publishing
+and still verifies/reconciles the GitHub tag and release metadata.
 
 ### Integration tests (real providers)
 
