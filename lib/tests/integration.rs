@@ -29,14 +29,12 @@ macro_rules! require_env {
 #[tokio::test]
 async fn test_openai_simple_chat() {
     let api_key = require_env!("OPENAI_API_KEY");
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
 
-    let provider = Arc::new(
-        OpenAiProvider::new(&base_url, &api_key, &model)
-            .with_context_budget(50_000),
-    );
+    let provider =
+        Arc::new(OpenAiProvider::new(&base_url, &api_key, &model).with_context_budget(50_000));
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
@@ -80,8 +78,8 @@ async fn test_openai_simple_chat() {
 #[tokio::test]
 async fn test_openai_tool_calling() {
     let api_key = require_env!("OPENAI_API_KEY");
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let base_url =
+        std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
 
     let provider = Arc::new(OpenAiProvider::new(&base_url, &api_key, &model));
@@ -214,7 +212,11 @@ async fn test_anthropic_tool_calling() {
         result.response
     );
     // Verify the tool loop actually happened
-    let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+    let tool_msgs: Vec<_> = result
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .collect();
     assert!(!tool_msgs.is_empty(), "Should have tool result messages");
     assert!(
         result.total_usage.total_tokens > 0,
@@ -223,11 +225,27 @@ async fn test_anthropic_tool_calling() {
 }
 
 #[tokio::test]
+async fn test_anthropic_model_discovery() {
+    let api_key = require_env!("ANTHROPIC_API_KEY");
+
+    let models =
+        discovery::list_models("https://api.anthropic.com", &AuthStrategy::ApiKey(api_key))
+            .await
+            .expect("Anthropic model discovery should succeed");
+
+    assert!(!models.is_empty(), "Anthropic should return models");
+    assert!(
+        models.iter().any(|model| model.id.starts_with("claude-")),
+        "Anthropic model discovery should include Claude models"
+    );
+}
+
+#[tokio::test]
 async fn test_azure_openai_chat() {
     let endpoint = require_env!("AZURE_OPENAI_ENDPOINT");
     let api_key = require_env!("AZURE_OPENAI_API_KEY");
-    let deployment = std::env::var("AZURE_OPENAI_CHAT_DEPLOYMENT")
-        .unwrap_or_else(|_| "gpt-4o".into());
+    let deployment =
+        std::env::var("AZURE_OPENAI_CHAT_DEPLOYMENT").unwrap_or_else(|_| "gpt-4o".into());
 
     // Build the full Azure OpenAI chat completions URL if not already included
     let url = if endpoint.contains("/chat/completions") {
@@ -270,8 +288,7 @@ async fn test_azure_openai_chat() {
 #[tokio::test]
 async fn test_direct_openai_simple_chat() {
     let api_key = require_env!("DIRECT_OPENAI_API_KEY");
-    let model =
-        std::env::var("DIRECT_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let model = std::env::var("DIRECT_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
 
     let provider = Arc::new(
         OpenAiProvider::new("https://api.openai.com/v1", &api_key, &model)
@@ -326,8 +343,7 @@ async fn test_direct_openai_simple_chat() {
 #[tokio::test]
 async fn test_direct_openai_tool_calling() {
     let api_key = require_env!("DIRECT_OPENAI_API_KEY");
-    let model =
-        std::env::var("DIRECT_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let model = std::env::var("DIRECT_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
 
     let provider = Arc::new(OpenAiProvider::new(
         "https://api.openai.com/v1",
@@ -379,6 +395,10 @@ async fn test_direct_openai_tool_calling() {
         "Direct OpenAI should report usage"
     );
     // Verify the tool loop actually happened
-    let tool_msgs: Vec<_> = result.messages.iter().filter(|m| m.role == "tool").collect();
+    let tool_msgs: Vec<_> = result
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .collect();
     assert!(!tool_msgs.is_empty(), "Should have tool result messages");
 }
