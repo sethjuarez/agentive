@@ -46,8 +46,7 @@ use tokio::net::TcpListener;
 pub const AZURE_OPENAI_SCOPE: &str = "https://ai.azure.com/.default offline_access";
 
 /// Scope for Azure Resource Manager (ARM) API — subscription/resource discovery.
-pub const AZURE_MANAGEMENT_SCOPE: &str =
-    "https://management.azure.com/.default offline_access";
+pub const AZURE_MANAGEMENT_SCOPE: &str = "https://management.azure.com/.default offline_access";
 
 /// Azure PowerShell first-party client ID — works for cognitive services scopes.
 pub const DEFAULT_CLIENT_ID: &str = "1950a258-227b-4e31-a9cf-717495945fc2";
@@ -129,8 +128,7 @@ fn extract_query_param(path: &str, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Pending TCP listeners keyed by port, kept alive between start and wait.
-fn pending_listeners() -> &'static tokio::sync::Mutex<std::collections::HashMap<u16, TcpListener>>
-{
+fn pending_listeners() -> &'static tokio::sync::Mutex<std::collections::HashMap<u16, TcpListener>> {
     static INSTANCE: std::sync::OnceLock<
         tokio::sync::Mutex<std::collections::HashMap<u16, TcpListener>>,
     > = std::sync::OnceLock::new();
@@ -395,47 +393,84 @@ pub async fn poll_for_token(
     );
 
     let http = reqwest::Client::new();
-    let interval = std::time::Duration::from_secs(interval_secs.max(5));
+    let mut interval = std::time::Duration::from_secs(interval_secs.max(5));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut first_poll = true;
 
     loop {
         if std::time::Instant::now() > deadline {
             return Err("Device code flow timed out".into());
         }
-        tokio::time::sleep(interval).await;
+        if first_poll {
+            first_poll = false;
+        } else {
+            sleep_within_deadline(interval, deadline).await?;
+        }
 
-        let resp = http
-            .post(&url)
-            .form(&[
-                ("client_id", cid),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", device_code),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("Token poll failed: {e}"))?;
+        let request_timeout = remaining_until(deadline)?;
+        let resp = tokio::time::timeout(
+            request_timeout,
+            http.post(&url)
+                .form(&[
+                    ("client_id", cid),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", device_code),
+                ])
+                .send(),
+        )
+        .await
+        .map_err(|_| "Device code flow timed out".to_string())?
+        .map_err(|e| format!("Token poll failed: {e}"))?;
 
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| format!("Read error: {e}"))?;
+        let body = tokio::time::timeout(remaining_until(deadline)?, resp.text())
+            .await
+            .map_err(|_| "Device code flow timed out".to_string())?
+            .map_err(|e| format!("Read error: {e}"))?;
 
         if status.is_success() {
-            return serde_json::from_str(&body)
-                .map_err(|e| format!("Failed to parse token: {e}"));
+            return serde_json::from_str(&body).map_err(|e| format!("Failed to parse token: {e}"));
         }
 
         if let Ok(err) = serde_json::from_str::<TokenErrorResponse>(&body) {
             match err.error.as_str() {
                 "authorization_pending" => continue,
                 "slow_down" => {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    interval += std::time::Duration::from_secs(5);
                     continue;
                 }
                 "expired_token" => return Err("Device code expired".into()),
                 other => return Err(format!("Token error: {other}")),
             }
         }
+
         return Err(format!("Unexpected response ({status}): {body}"));
     }
+}
+
+fn remaining_until(deadline: std::time::Instant) -> Result<std::time::Duration, String> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "Device code flow timed out".to_string())
+}
+
+fn bounded_delay(
+    delay: std::time::Duration,
+    remaining: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    if remaining.is_zero() {
+        return Err("Device code flow timed out".into());
+    }
+    Ok(delay.min(remaining))
+}
+
+async fn sleep_within_deadline(
+    delay: std::time::Duration,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    tokio::time::sleep(bounded_delay(delay, remaining_until(deadline)?)?).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -548,14 +583,8 @@ mod tests {
             extract_query_param("/?code=abc123&state=xyz", "state"),
             Some("xyz".into())
         );
-        assert_eq!(
-            extract_query_param("/?code=abc123", "missing"),
-            None
-        );
-        assert_eq!(
-            extract_query_param("/no-query", "code"),
-            None
-        );
+        assert_eq!(extract_query_param("/?code=abc123", "missing"), None);
+        assert_eq!(extract_query_param("/no-query", "code"), None);
     }
 
     #[test]
@@ -578,6 +607,22 @@ mod tests {
         let html = error_html("TestApp", "bad credentials");
         assert!(html.contains("TestApp"));
         assert!(html.contains("bad credentials"));
+    }
+
+    #[test]
+    fn test_bounded_delay_caps_to_remaining_time() {
+        let delay = std::time::Duration::from_secs(30);
+        let remaining = std::time::Duration::from_secs(5);
+
+        assert_eq!(bounded_delay(delay, remaining).unwrap(), remaining);
+    }
+
+    #[test]
+    fn test_bounded_delay_rejects_expired_deadline() {
+        let err = bounded_delay(std::time::Duration::from_secs(5), std::time::Duration::ZERO)
+            .unwrap_err();
+
+        assert_eq!(err, "Device code flow timed out");
     }
 
     #[tokio::test]

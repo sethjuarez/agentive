@@ -159,10 +159,7 @@ fn foundry_base(endpoint: &str) -> &str {
 ///
 /// Automatically detects the endpoint type (Azure OpenAI, Foundry, or OpenAI)
 /// and calls the appropriate API.
-pub async fn list_models(
-    endpoint: &str,
-    auth: &AuthStrategy,
-) -> Result<Vec<ModelInfo>, String> {
+pub async fn list_models(endpoint: &str, auth: &AuthStrategy) -> Result<Vec<ModelInfo>, String> {
     let endpoint = endpoint.trim_end_matches('/');
 
     if is_foundry(endpoint) {
@@ -175,10 +172,7 @@ pub async fn list_models(
 }
 
 /// Azure OpenAI: GET /openai/deployments?api-version=2024-10-21
-async fn list_models_azure(
-    endpoint: &str,
-    auth: &AuthStrategy,
-) -> Result<Vec<ModelInfo>, String> {
+async fn list_models_azure(endpoint: &str, auth: &AuthStrategy) -> Result<Vec<ModelInfo>, String> {
     let endpoint = normalize_azure_endpoint(endpoint);
     let url = format!("{endpoint}/openai/deployments?api-version=2024-10-21");
     let body = fetch_body(&url, auth).await?;
@@ -186,10 +180,7 @@ async fn list_models_azure(
 }
 
 /// Standard OpenAI: GET /v1/models
-async fn list_models_openai(
-    endpoint: &str,
-    auth: &AuthStrategy,
-) -> Result<Vec<ModelInfo>, String> {
+async fn list_models_openai(endpoint: &str, auth: &AuthStrategy) -> Result<Vec<ModelInfo>, String> {
     let base = if endpoint.is_empty() {
         "https://api.openai.com"
     } else {
@@ -208,12 +199,19 @@ async fn list_models_foundry(
     // Try project-level deployments first (small, deployed-only list)
     if endpoint.contains("/api/projects") {
         let url = format!("{}/deployments?api-version=v1", endpoint);
-        if let Ok(body) = fetch_body(&url, auth).await {
-            if let Ok(models) = parse_foundry_project_deployments(&body) {
-                if !models.is_empty() {
-                    return Ok(models);
-                }
-            }
+        match fetch_body(&url, auth).await {
+            Ok(body) => match parse_foundry_project_deployments(&body) {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                Ok(_) => log_foundry_project_fallback(&url, "project deployment list was empty"),
+                Err(err) => log_foundry_project_fallback(
+                    &url,
+                    &format!("failed to parse project deployments: {err}"),
+                ),
+            },
+            Err(err) => log_foundry_project_fallback(
+                &url,
+                &format!("project deployment request failed: {err}"),
+            ),
         }
     }
 
@@ -224,15 +222,23 @@ async fn list_models_foundry(
     parse_foundry_catalog(&body, true)
 }
 
+fn log_foundry_project_fallback(project_url: &str, reason: &str) {
+    log::warn!("{}", foundry_project_fallback_message(project_url, reason));
+}
+
+fn foundry_project_fallback_message(project_url: &str, reason: &str) -> String {
+    format!(
+        "Foundry project model discovery fell back to the hub catalog; project_url={project_url}; reason={reason}"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // HTTP + parsing helpers
 // ---------------------------------------------------------------------------
 
 async fn fetch_body(url: &str, auth: &AuthStrategy) -> Result<String, String> {
     let http = reqwest::Client::new();
-    let req = http
-        .get(url)
-        .timeout(std::time::Duration::from_secs(30));
+    let req = http.get(url).timeout(std::time::Duration::from_secs(30));
     let req = auth.apply(req);
 
     let resp = req
@@ -336,7 +342,9 @@ mod tests {
 
     #[test]
     fn test_is_foundry() {
-        assert!(is_foundry("https://my-project.services.ai.azure.com/api/projects/proj1"));
+        assert!(is_foundry(
+            "https://my-project.services.ai.azure.com/api/projects/proj1"
+        ));
         assert!(!is_foundry("https://my-resource.openai.azure.com"));
         assert!(!is_foundry("https://api.openai.com"));
     }
@@ -344,7 +352,9 @@ mod tests {
     #[test]
     fn test_is_azure_openai() {
         assert!(is_azure_openai("https://my-resource.openai.azure.com"));
-        assert!(is_azure_openai("https://my-resource.cognitiveservices.azure.com"));
+        assert!(is_azure_openai(
+            "https://my-resource.cognitiveservices.azure.com"
+        ));
         assert!(!is_azure_openai("https://my-project.services.ai.azure.com"));
         assert!(!is_azure_openai("https://api.openai.com"));
     }
@@ -417,9 +427,23 @@ mod tests {
     }
 
     #[test]
+    fn test_foundry_project_fallback_message_includes_context() {
+        let message = foundry_project_fallback_message(
+            "https://host.services.ai.azure.com/api/projects/p1/deployments?api-version=v1",
+            "project deployment list was empty",
+        );
+
+        assert!(message.contains("fell back to the hub catalog"));
+        assert!(message.contains("/api/projects/p1/deployments"));
+        assert!(message.contains("project deployment list was empty"));
+    }
+
+    #[test]
     fn test_parse_empty_responses() {
         assert!(parse_openai_models(r#"{"data":[]}"#).unwrap().is_empty());
-        assert!(parse_foundry_project_deployments(r#"{"value":[]}"#).unwrap().is_empty());
+        assert!(parse_foundry_project_deployments(r#"{"value":[]}"#)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
