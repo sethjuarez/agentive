@@ -3,27 +3,42 @@ name: Publish crate
 on:
   workflow_dispatch:
     inputs:
+      version:
+        description: "Version to publish and release, matching lib/Cargo.toml"
+        required: true
+        type: string
       confirm_publish:
-        description: "Type publish to publish the current lib/Cargo.toml version to crates.io"
+        description: "Type publish to publish/reconcile this version"
         required: true
         type: string
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: publish-crate
+  cancel-in-progress: false
 
 jobs:
   publish:
-    name: Test and publish agentive
+    name: Test, publish, and release agentive
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Confirm publish intent
         run: |
           if [ "${{ inputs.confirm_publish }}" != "publish" ]; then
             echo "Refusing to publish without confirm_publish=publish"
+            exit 1
+          fi
+
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "Publish crate must run from main, not ${{ github.ref }}"
             exit 1
           fi
 
@@ -37,17 +52,40 @@ jobs:
 
       - name: Read crate metadata
         id: metadata
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import re
+          import os
+          import sys
           from pathlib import Path
+
+          expected_version = os.environ["EXPECTED_VERSION"].strip()
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", expected_version):
+              print(f"Invalid version input: {expected_version}", file=sys.stderr)
+              sys.exit(1)
 
           manifest = Path("lib/Cargo.toml").read_text()
           name = re.search(r'^name\s*=\s*"([^"]+)"', manifest, re.MULTILINE).group(1)
           version = re.search(r'^version\s*=\s*"([^"]+)"', manifest, re.MULTILINE).group(1)
 
+          lock = Path("lib/Cargo.lock").read_text()
+          package_match = re.search(
+              rf'(?ms)^\[\[package\]\]\s*^name\s*=\s*"{re.escape(name)}"\s*^version\s*=\s*"([^"]+)"',
+              lock,
+          )
+          if not package_match:
+              print(f"Could not find {name} in lib/Cargo.lock", file=sys.stderr)
+              sys.exit(1)
+
+          lock_version = package_match.group(1)
+
           print(f"name={name}")
-          print(f"version={version}")
+          print(f"current_version={version}")
+          print(f"current_lock_version={lock_version}")
+          print(f"version={expected_version}")
+          print(f"tag=v{expected_version}")
           PY
 
       - name: Check crates.io version
@@ -72,6 +110,27 @@ jobs:
             exit 1
           fi
 
+      - name: Verify publish metadata
+        if: steps.crate.outputs.publish == 'true'
+        env:
+          CRATE_VERSION: ${{ steps.metadata.outputs.version }}
+          CURRENT_VERSION: ${{ steps.metadata.outputs.current_version }}
+          CURRENT_LOCK_VERSION: ${{ steps.metadata.outputs.current_lock_version }}
+        run: |
+          if [ "$CURRENT_VERSION" != "$CRATE_VERSION" ]; then
+            echo "lib/Cargo.toml version ${CURRENT_VERSION} does not match workflow input ${CRATE_VERSION}"
+            exit 1
+          fi
+
+          if [ "$CURRENT_LOCK_VERSION" != "$CRATE_VERSION" ]; then
+            echo "lib/Cargo.lock version ${CURRENT_LOCK_VERSION} does not match workflow input ${CRATE_VERSION}"
+            exit 1
+          fi
+
+      - name: Package dry run
+        if: steps.crate.outputs.publish == 'true'
+        run: cargo publish --manifest-path lib/Cargo.toml --dry-run
+
       - name: Publish to crates.io
         if: steps.crate.outputs.publish == 'true'
         env:
@@ -83,3 +142,129 @@ jobs:
           fi
 
           cargo publish --manifest-path lib/Cargo.toml
+
+      - name: Wait for crates.io availability
+        env:
+          CRATE_NAME: ${{ steps.metadata.outputs.name }}
+          CRATE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          for attempt in {1..12}; do
+            status=$(curl -sS -H "User-Agent: sethjuarez/agentive publish workflow (https://github.com/sethjuarez/agentive)" \
+              -o /tmp/crate.json -w "%{http_code}" \
+              "https://crates.io/api/v1/crates/${CRATE_NAME}/${CRATE_VERSION}")
+
+            if [ "$status" = "200" ]; then
+              echo "${CRATE_NAME} ${CRATE_VERSION} is available on crates.io"
+              exit 0
+            fi
+
+            echo "crates.io returned $status for ${CRATE_NAME} ${CRATE_VERSION}; retrying (${attempt}/12)"
+            sleep 10
+          done
+
+          echo "${CRATE_NAME} ${CRATE_VERSION} did not become available on crates.io"
+          cat /tmp/crate.json
+          exit 1
+
+      - name: Reconcile Git tag
+        id: release_target
+        env:
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          CRATE_NAME: ${{ steps.metadata.outputs.name }}
+          CRATE_VERSION: ${{ steps.metadata.outputs.version }}
+          CRATE_PUBLISHED: ${{ steps.crate.outputs.publish == 'false' }}
+        run: |
+          git fetch --tags origin
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/tmp/release-tag; then
+            peeled_sha=$(git ls-remote --tags origin "refs/tags/${RELEASE_TAG}^{}" | awk '{print $1}')
+            if [ -z "$peeled_sha" ]; then
+              peeled_sha=$(awk '{print $1}' /tmp/release-tag)
+            fi
+
+            if ! git cat-file -e "${peeled_sha}^{commit}"; then
+              echo "${RELEASE_TAG} does not resolve to a commit"
+              exit 1
+            fi
+
+            if ! git show "${peeled_sha}:lib/Cargo.toml" | grep -qxF "version = \"${CRATE_VERSION}\""; then
+              echo "${RELEASE_TAG} points at ${peeled_sha}, but lib/Cargo.toml does not contain version ${CRATE_VERSION}"
+              exit 1
+            fi
+
+            echo "${RELEASE_TAG} already points at ${peeled_sha}"
+            echo "sha=${peeled_sha}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$CRATE_PUBLISHED" = "true" ]; then
+            target_sha=""
+            while read -r candidate; do
+              if git show "${candidate}:lib/Cargo.toml" | grep -qxF "version = \"${CRATE_VERSION}\""; then
+                target_sha="$candidate"
+                break
+              fi
+            done < <(git log --format=%H -- lib/Cargo.toml)
+
+            if [ -z "$target_sha" ]; then
+              echo "Could not find a commit that sets lib/Cargo.toml to ${CRATE_VERSION}"
+              exit 1
+            fi
+          else
+            target_sha=$(git rev-parse HEAD)
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" -m "${CRATE_NAME} ${CRATE_VERSION}" "$target_sha"
+          git push origin "$RELEASE_TAG"
+          echo "sha=${target_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          CRATE_NAME: ${{ steps.metadata.outputs.name }}
+          CRATE_VERSION: ${{ steps.metadata.outputs.version }}
+          RELEASE_SHA: ${{ steps.release_target.outputs.sha }}
+        run: |
+          previous_tag=""
+          while read -r candidate; do
+            if [ "$candidate" = "$RELEASE_TAG" ]; then
+              break
+            fi
+            previous_tag="$candidate"
+          done < <(git tag --sort=v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+')
+
+          compare_url="https://github.com/${{ github.repository }}/commits/${RELEASE_TAG}"
+          if [ -n "$previous_tag" ]; then
+            compare_url="https://github.com/${{ github.repository }}/compare/${previous_tag}...${RELEASE_TAG}"
+          fi
+
+          cat > /tmp/release-notes.md <<EOF
+          ## What's changed
+
+          - Published \`${CRATE_NAME}\` ${CRATE_VERSION} to crates.io, or verified it was already published.
+          - Reconciled the annotated Git tag and GitHub release metadata for \`${RELEASE_TAG}\`.
+          - Changes since the previous release: ${compare_url}
+
+          ## Validation
+
+          - \`cargo test --manifest-path lib/Cargo.toml\`
+          - \`cargo publish --manifest-path lib/Cargo.toml --dry-run\` for newly published versions
+          - crates.io availability check for \`${CRATE_NAME}\` ${CRATE_VERSION}
+          - Git tag target verification for \`${RELEASE_TAG}\` at \`${RELEASE_SHA}\`
+          EOF
+
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --title "${CRATE_NAME} ${CRATE_VERSION}" \
+              --notes-file /tmp/release-notes.md
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --verify-tag \
+              --title "${CRATE_NAME} ${CRATE_VERSION}" \
+              --notes-file /tmp/release-notes.md
+          fi
