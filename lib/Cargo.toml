@@ -1,6 +1,6 @@
 [package]
 name = "agentive"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "A Rust crate for building agentic LLM applications with streaming, tool calling, and multi-turn conversation loops"
 license = "MIT"
