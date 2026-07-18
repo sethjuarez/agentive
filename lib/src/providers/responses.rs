@@ -20,6 +20,12 @@ use crate::error::AgentError;
 use crate::provider::Provider;
 use crate::providers::request_compaction::{
     compact_items_to_request_limit, default_azure_max_request_bytes,
+    default_azure_request_reserved_bytes,
+};
+#[cfg(test)]
+use crate::providers::request_compaction::{
+    effective_request_budget_bytes, DEFAULT_AZURE_MAX_REQUEST_BYTES,
+    DEFAULT_AZURE_REQUEST_RESERVED_BYTES,
 };
 use crate::providers::sse::SseParser;
 use crate::types::*;
@@ -44,6 +50,7 @@ pub struct ResponsesProvider {
     context_budget: usize,
     vision: bool,
     max_request_bytes: usize,
+    reserved_request_bytes: usize,
 }
 
 impl ResponsesProvider {
@@ -67,6 +74,7 @@ impl ResponsesProvider {
             context_budget: 200_000,
             vision: false,
             max_request_bytes: default_azure_max_request_bytes(trimmed),
+            reserved_request_bytes: default_azure_request_reserved_bytes(trimmed),
         }
     }
 
@@ -81,6 +89,7 @@ impl ResponsesProvider {
             context_budget: 200_000,
             vision: false,
             max_request_bytes: default_azure_max_request_bytes(trimmed),
+            reserved_request_bytes: default_azure_request_reserved_bytes(trimmed),
         }
     }
 
@@ -251,6 +260,7 @@ impl ResponsesProvider {
         compact_items_to_request_limit(
             input,
             self.max_request_bytes,
+            self.reserved_request_bytes,
             "Responses",
             "input item",
             |input| Ok(make_body(input)),
@@ -804,9 +814,14 @@ mod tests {
     fn test_request_size_guard_defaults_to_azure_only() {
         let azure = ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
         assert_eq!(azure.request_budget_bytes(), Some(64 * 1024));
+        assert_eq!(
+            azure.reserved_request_bytes,
+            DEFAULT_AZURE_REQUEST_RESERVED_BYTES
+        );
 
         let openai = ResponsesProvider::new("https://api.openai.com", "key", "gpt-4o");
         assert_eq!(openai.request_budget_bytes(), None);
+        assert_eq!(openai.reserved_request_bytes, 0);
 
         let custom = ResponsesProvider::with_auth(
             "https://llm.example.test",
@@ -1081,5 +1096,67 @@ mod tests {
 
         // With max disabled, no compaction should occur
         assert_eq!(body["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_body_within_limit_uses_reserved_azure_overhead() {
+        let sizing_provider =
+            ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o")
+                .with_max_request_bytes(usize::MAX);
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user(&"old web context ".repeat(70)),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("recent question"),
+        ];
+        let mut input = sizing_provider.messages_to_input(&messages);
+        let body_at_nominal_limit = sizing_provider
+            .build_body_within_limit(&mut input, &None, true)
+            .unwrap();
+        let nominal_cap = serde_json::to_string(&body_at_nominal_limit).unwrap().len() + 8;
+        let effective_cap =
+            effective_request_budget_bytes(nominal_cap, DEFAULT_AZURE_REQUEST_RESERVED_BYTES);
+        assert!(serde_json::to_string(&body_at_nominal_limit).unwrap().len() <= nominal_cap);
+        assert!(serde_json::to_string(&body_at_nominal_limit).unwrap().len() > effective_cap);
+
+        let provider =
+            ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o")
+                .with_max_request_bytes(nominal_cap);
+        let mut compacted_input = provider.messages_to_input(&messages);
+        let body = provider
+            .build_body_within_limit(&mut compacted_input, &None, true)
+            .unwrap();
+        let compacted_len = serde_json::to_string(&body).unwrap().len();
+
+        assert!(compacted_len <= effective_cap);
+        assert!(!compacted_input.iter().any(|item| item
+            .get("content")
+            .and_then(|content| content.as_str())
+            .is_some_and(|content| content.contains("old web context"))));
+        assert_eq!(
+            compacted_input
+                .last()
+                .and_then(|item| item.get("content"))
+                .and_then(|content| content.as_str()),
+            Some("recent question")
+        );
+    }
+
+    #[test]
+    fn test_request_budget_defaults_are_provider_aware() {
+        let openai = ResponsesProvider::new("https://api.openai.com/v1", "key", "gpt-4o");
+        assert_eq!(openai.request_budget_bytes(), None);
+        assert_eq!(openai.max_request_bytes, usize::MAX);
+        assert_eq!(openai.reserved_request_bytes, 0);
+
+        let azure = ResponsesProvider::new("https://my-resource.openai.azure.com", "key", "gpt-4o");
+        assert_eq!(
+            azure.request_budget_bytes(),
+            Some(DEFAULT_AZURE_MAX_REQUEST_BYTES)
+        );
+        assert_eq!(
+            effective_request_budget_bytes(azure.max_request_bytes, azure.reserved_request_bytes),
+            DEFAULT_AZURE_MAX_REQUEST_BYTES - DEFAULT_AZURE_REQUEST_RESERVED_BYTES
+        );
     }
 }

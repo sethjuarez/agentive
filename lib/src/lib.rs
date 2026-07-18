@@ -60,7 +60,12 @@ pub use auth::AuthStrategy;
 pub use cancel::CancellationToken;
 pub use chat::simple_chat;
 pub use checkpoint::Checkpoint;
-pub use context_index::{ContextItem, ContextSource, ReferenceRecord, SearchIndexEntry};
+pub use context_index::{
+    ContextItem, ContextKind, ContextKindBudget, ContextPackAction, ContextPackDecision,
+    ContextPacker, ContextPackingConfig, ContextScope, ContextSearchQuery, ContextSearchResult,
+    ContextSensitivity, ContextSource, InMemoryContextIndex, LargeContextRef, LocalContextIndex,
+    PackedContext, PackedContextItem, ReferenceRecord, SearchIndexEntry,
+};
 pub use discovery::{
     recommended_anthropic_default_model, recommended_anthropic_model, recommended_openai_model,
     validate_or_recommend_model, AnthropicModelTier, ModelInfo, ModelSelection,

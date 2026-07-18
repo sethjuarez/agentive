@@ -49,7 +49,7 @@ fn strip_inline_base64(s: &str) -> String {
     result
 }
 
-/// Sanitize all text in a [`ChatMessage`] — content, content parts, and
+/// Sanitize all text in a [`crate::types::ChatMessage`] — content, content parts, and
 /// tool call arguments. Call this before sending messages to an LLM API
 /// to prevent JSON parse errors from control characters in user input,
 /// tool results, or model-generated content.
