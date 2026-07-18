@@ -33,6 +33,7 @@ lib/src/
 │   └── sse.rs              # Shared SSE line parser
 ├── runner.rs               # Agentic loop: run(), RunnerConfig, RunnerEvent, @reference resolver
 ├── context.rs              # Context window trimming + LLM-powered summarization
+├── context_index.rs        # Typed context items, budgeted packing, local context index trait
 ├── sanitize.rs             # Tool result sanitization
 ├── memory.rs               # Agent memory: MemoryStore, recall, system prompt injection, tool defs
 ├── discovery.rs            # Model listing across endpoint types
@@ -154,6 +155,7 @@ Events emitted by the runner to the consuming app:
 - `ToolCallStart { name, arguments, tool_call_id, iteration }` — tool being invoked, with LLM-assigned call ID and loop round
 - `ToolResult { name, result, tool_call_id, elapsed_ms, iteration }` — tool returned, with timing and correlation
 - `Usage { usage }` — token usage after each LLM call (`Usage { prompt_tokens, completion_tokens, total_tokens }`)
+- `ContextPacked { run_id, iteration, selected_count, dropped_count, total_bytes, budget_bytes, decisions }` — budgeted context selection observability
 - `MessagesUpdated { messages }` — full history after a tool round (for persistence)
 - `Done { response, messages, elapsed_ms }` — final text + full history + total run time
 - `Error { message }` — error description
@@ -199,6 +201,7 @@ where
 - `retry_on_400: true` — retry once on HTTP 400
 - `auto_trim_context: true` — trim old messages when over budget
 - `sanitize_tool_results: true` — strip control chars and base64
+- `tool_result_budget: Some(ToolResultBudget::default())` — bound oversized tool results before they enter history
 - `parallel_tool_calls: true` — execute multiple tool calls concurrently
 - `response_format: None` — optional structured output (JSON mode or JSON schema)
 - `compaction_provider: None` — optional LLM provider for richer context compaction
@@ -206,6 +209,8 @@ where
 - `run_id: None` — auto-generates UUID v4 if not set; use for trace correlation
 - `parent_run_id: None` — set when delegating to link child runs to parent
 - `reference_resolver: None` — optional async resolver for `@reference` syntax in user messages
+- `context_items: Vec::new()` — optional typed context available for per-round packing
+- `context_packing: None` — opt-in policy for transient `<context_pack>` injection
 
 ### RunnerResult
 - `messages: Vec<ChatMessage>` — full conversation history
@@ -228,7 +233,10 @@ pub trait Provider: Send + Sync {
     ) -> Result<(), AgentError>;
 
     fn name(&self) -> &str;
+    fn model(&self) -> Option<&str> { None }
     fn context_budget_chars(&self) -> usize { 200_000 }
+    fn request_budget_bytes(&self) -> Option<usize> { None }
+    fn estimate_request_bytes(&self, _request: &ChatRequest) -> Result<Option<usize>, AgentError> { Ok(None) }
     fn supports_vision(&self) -> bool { false }
 }
 ```
@@ -248,6 +256,15 @@ OpenAiProvider::new(endpoint, api_key, model)
     .with_vision(true)             // optional
 ```
 
+Request byte-budget behavior:
+- OpenAI-compatible non-Azure endpoints default to no byte cap (`usize::MAX`).
+- Azure/OpenAI-compatible endpoints default to a 64KB serialized request cap with
+  reserved overhead before provider serialization.
+- If compaction cannot fit the serialized body, the provider returns an actionable
+  "reduce attached files, references, web content, or earlier context" error.
+- Keep Azure-specific request margins provider-aware; do not apply them globally
+  to Anthropic or unknown providers.
+
 ### AnthropicProvider
 Anthropic Messages API with content block streaming:
 ```rust
@@ -260,6 +277,7 @@ Handles Anthropic-specific concerns:
 - Tool calls sent as `tool_use` content blocks
 - Tool results sent as `tool_result` content blocks in user messages
 - `thinking_delta` events for extended thinking models
+- No default serialized byte cap; callers can opt in with `with_max_request_bytes`.
 
 ### ResponsesProvider
 
@@ -282,10 +300,10 @@ Key differences from Chat Completions:
 - Tool defs are flattened (no `function` wrapper)
 - **Request body guard**: The Azure Responses API silently truncates bodies at
   ~79KB. The provider measures the actual serialized JSON byte count and drops
-  the oldest non-system input items until the body fits within
-  `max_request_bytes` (default 64KB). `function_call` / `function_call_output`
-  pairs are dropped together to avoid orphaned tool results. Set
-  `with_max_request_bytes(usize::MAX)` to disable.
+  the oldest non-system input items until the body fits within the effective safe
+  budget: `max_request_bytes` (default 64KB for Azure) minus reserved overhead.
+  `function_call` / `function_call_output` pairs are dropped together to avoid
+  orphaned tool results. Set `with_max_request_bytes(usize::MAX)` to disable.
 
 ## One-shot chat: `simple_chat()`
 
@@ -418,6 +436,121 @@ let config = RunnerConfig {
     ..Default::default()
 };
 ```
+
+## Context harness (context_index.rs + runner.rs)
+
+Agentive 0.6.0 adds typed, budgeted context orchestration. The intended mental
+model is:
+
+```text
+raw host context -> ContextItem records -> retrieval/ranking -> ContextPacker
+  -> transient <context_pack> -> provider request -> provider byte safety rails
+```
+
+Context compaction is the emergency brake. Do not use compaction as the primary
+strategy for large web pages, files, logs, memories, or tool outputs. Hosts should
+prefer bounded context items, local retrieval, large payload references, and
+budgeted packing before the provider sees the request.
+
+### Core types
+
+- `ContextItem` — host-supplied context candidate with `source`, `kind`,
+  `priority`, `sensitivity`, optional `content`, optional `large_ref`, and
+  metadata.
+- `ContextKind` — budget category (`RecentTurn`, `MemoryFact`, `ReferenceDoc`,
+  `ToolObservation`, `FileExcerpt`, `WebExcerpt`, `ErrorTrace`,
+  `MediaSummary`, `Other`).
+- `ContextSensitivity` — `Secret` is excluded by default; `Private` is included
+  unless `include_private` is false.
+- `LargeContextRef` — stable pointer to full payload content stored outside the
+  prompt, with an `expand_tool` the host can expose later.
+- `ContextPackingConfig` and `ContextKindBudget` — total, per-kind, per-item,
+  and preview budgets.
+- `ContextPacker` — deterministic ranking and rendered-byte-aware packing.
+- `LocalContextIndex` — trait for host-owned search/vector stores; the crate
+  includes deterministic `InMemoryContextIndex` for lexical tests and simple
+  local use.
+
+### Runner integration
+
+Opt in with:
+
+```rust
+let config = RunnerConfig {
+    context_items,
+    context_packing: Some(ContextPackingConfig::default()),
+    ..Default::default()
+};
+```
+
+When enabled:
+1. The runner packs context each model-call round using the latest user query.
+2. It emits `RunnerEvent::ContextPacked` with all selected/dropped/redacted
+   decisions for observability.
+3. It renders a `<context_pack>` block labeled as untrusted reference material.
+4. It inserts that block before the latest user message, so the user's final
+   request remains the most recent instruction.
+5. It sends the packed block only in the provider request. It is never appended
+   to `RunnerResult.messages`, `new_messages`, or `MessagesUpdated` history.
+6. If the packed block makes the provider request exceed the request budget, the
+   runner drops the transient pack before compacting durable conversation
+   history. Durable history must not be sacrificed to keep transient context.
+7. 400 retries reuse the same prepared request messages, preserving packed
+   context when it fit the first attempt.
+
+### Packing rules and invariants
+
+- Use rendered prompt bytes, not raw content bytes. XML escaping, attributes,
+  content type tags, and large-ref tags all count against budget.
+- Prefer large refs for big payloads. A `LargeContextRef` lets the model see a
+  preview plus an expansion handle without paying for the full blob.
+- Duplicate `large_ref.id` values are packed only once.
+- Secret context is redacted by default.
+- Packed context is untrusted. Never allow text inside `<context_pack>` to
+  override the latest user request, system prompt, or tool policies.
+- Public context structs are `#[non_exhaustive]`; prefer builder methods
+  (`ContextItem::new().with_kind(...).with_content(...)`) over struct literals.
+
+### Host guidance
+
+Apps like CutReady should not inline full fetched web pages or unbounded
+reference text into the final user message. They should:
+
+1. Store full payloads in a host-owned blob/file/database store.
+2. Create `ContextItem`s with short summaries or high-signal excerpts.
+3. Attach `LargeContextRef` handles for expansion.
+4. Use local retrieval (lexical, vector, or hybrid) to select candidates.
+5. Let `ContextPacker` assemble a bounded prompt pack.
+6. Treat Agentive provider byte guards as final safety rails, not the first
+   filter.
+
+### Common footguns for agents
+
+- Do not persist `<context_pack>` into conversation history.
+- Do not append packed context after the latest user message.
+- Do not compact durable history just to keep transient packed context.
+- Do not use `estimated_bytes` alone to decide prompt fit; rendered XML must fit.
+- Do not add broad fallback behavior that silently drops user messages.
+- Do not make Azure/OpenAI byte margins global across all providers.
+- Do not inline huge web/file/tool payloads when a `LargeContextRef` would work.
+
+### Required tests when changing context or request budgeting
+
+Run the smallest focused tests first, then the full suite:
+
+```bash
+cd lib
+cargo test --lib context_index
+cargo test --lib context_packing
+cargo test --lib request_budget_defaults
+cargo test --lib tool_heavy
+cargo test --lib drops_pack_before_compacting
+cargo test
+```
+
+These cover CutReady-like web/reference floods, rendered XML byte budgets,
+provider-aware request caps, opt-in compatibility, tool-heavy long sessions, and
+the invariant that packed context is dropped before durable history compaction.
 
 ## Steering (steering.rs)
 
@@ -811,7 +944,7 @@ Agentive does NOT own persistence. Apps handle it via events:
 ```bash
 cd lib
 cargo build          # build the crate
-cargo test           # run all 195 tests (unit + doc + integration stubs)
+cargo test           # run unit, integration, and doc tests
 cargo doc --no-deps  # generate documentation
 ```
 
