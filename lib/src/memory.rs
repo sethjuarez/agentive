@@ -79,7 +79,7 @@ impl MemoryStore {
     /// Save a memory entry with deduplication and capacity management.
     ///
     /// For `Core` memories, entries with matching tags are replaced (dedup).
-    /// When the store exceeds [`MAX_MEMORIES`], the oldest archival entries
+    /// When the store exceeds the memory capacity, the oldest archival entries
     /// are evicted first, then the oldest non-archival entries if needed.
     pub fn save(&mut self, category: MemoryCategory, content: &str, tags: Vec<String>) {
         let now = chrono::Utc::now().to_rfc3339();

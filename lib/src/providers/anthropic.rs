@@ -181,6 +181,7 @@ impl AnthropicProvider {
         compact_items_to_request_limit(
             messages,
             self.max_request_bytes,
+            0,
             "Anthropic",
             "message",
             make_body,
@@ -819,6 +820,16 @@ mod tests {
         assert_eq!(body["system"], "Important system prompt");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"], "recent question");
+    }
+
+    #[test]
+    fn test_request_budget_is_opt_in_for_anthropic() {
+        let uncapped = AnthropicProvider::new("key", "claude-sonnet-4-20250514");
+        assert_eq!(uncapped.request_budget_bytes(), None);
+
+        let capped =
+            AnthropicProvider::new("key", "claude-sonnet-4-20250514").with_max_request_bytes(350);
+        assert_eq!(capped.request_budget_bytes(), Some(350));
     }
 
     #[test]
